@@ -18,6 +18,7 @@ HTTP Whisper is a native Windows HTTP, HTTPS, and WebSocket debugging proxy writ
 - HTTP and decoded WebSocket text replacement rules with regex capture replacements
 - Case-sensitive and case-insensitive response replacements
 - Default hiding of `detectportal.firefox.com`
+- Multiline Disallowed domains editor with wildcard and `re:` matching
 - Filtering by text and fields such as method, host, path, status, duration, process, and content type
 - Background request replay with captured replay results
 - Pinning, URL copy, JSON/HAR/cURL export APIs, body storage, and SQLite session storage

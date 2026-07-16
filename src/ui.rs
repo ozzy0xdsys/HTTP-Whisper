@@ -41,6 +41,7 @@ enum DialogKind {
 pub struct HttpWhisperApp {
     settings: AppSettings,
     settings_draft: AppSettings,
+    hidden_hosts_draft: String,
     auto_draft: Vec<AutoResponseRule>,
     auto_selected: usize,
     rewrite_draft: Vec<ResponseRewriteRule>,
@@ -67,6 +68,7 @@ impl HttpWhisperApp {
         configure_theme(&cc.egui_ctx);
         let auto_connect_pending = settings.auto_connect;
         let startup_error = configure_startup(settings.start_with_windows).err();
+        let hidden_hosts_draft = settings.hidden_hosts.join("\n");
         let (events_tx, events_rx) = mpsc::channel();
         let repository = AppPaths::discover()
             .ok()
@@ -74,6 +76,7 @@ impl HttpWhisperApp {
             .and_then(|repository| repository.initialize().ok().map(|()| repository));
         Self {
             settings_draft: settings.clone(),
+            hidden_hosts_draft,
             auto_draft: settings.auto_response_rules.clone(),
             rewrite_draft: settings.response_rewrite_rules.clone(),
             settings,
@@ -230,7 +233,10 @@ impl HttpWhisperApp {
 
     fn open_dialog(&mut self, kind: DialogKind) {
         match kind {
-            DialogKind::Settings => self.settings_draft = self.settings.clone(),
+            DialogKind::Settings => {
+                self.settings_draft = self.settings.clone();
+                self.hidden_hosts_draft = self.settings.hidden_hosts.join("\n");
+            }
             DialogKind::AutoResponses => {
                 self.auto_draft = self.settings.auto_response_rules.clone();
                 self.auto_selected = self
@@ -249,7 +255,8 @@ impl HttpWhisperApp {
     }
 
     fn save_settings(&mut self) {
-        let settings = self.settings_draft.clone();
+        let mut settings = self.settings_draft.clone();
+        settings.hidden_hosts = parse_hidden_hosts(&self.hidden_hosts_draft);
         match settings.save() {
             Ok(()) => {
                 self.settings = settings;
@@ -707,16 +714,8 @@ impl HttpWhisperApp {
                         ui.end_row();
                     });
                 ui.separator();
-                ui.label("Hidden hosts (one per line)");
-                let mut hidden = self.settings_draft.hidden_hosts.join("\n");
-                if scrollable_text_editor(ui, "hidden-hosts", &mut hidden, 70.0) {
-                    self.settings_draft.hidden_hosts = hidden
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .map(str::to_owned)
-                        .collect();
-                }
+                ui.label("Disallowed domains (one per line)");
+                scrollable_text_editor(ui, "hidden-hosts", &mut self.hidden_hosts_draft, 70.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Close").clicked() {
                         self.dialog = None;
@@ -949,7 +948,7 @@ impl HttpWhisperApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     ui.heading("HTTP Whisper");
-                    ui.label("Version 0.4.0");
+                    ui.label("Version 0.4.1");
                     ui.add_space(8.0);
                     ui.label("Native Rust HTTP/HTTPS and WebSocket debugging workbench");
                     ui.label("Classic Windows XP interface");
@@ -1212,6 +1211,14 @@ fn compact_rule_text(text: &str) -> String {
     preview.replace(['\r', '\n'], " ")
 }
 
+fn parse_hidden_hosts(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn row_values(session: &Session) -> Vec<String> {
     match session {
         Session::Http(exchange) => {
@@ -1463,6 +1470,15 @@ fn sample_sessions() -> Vec<Session> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disallowed_domains_are_parsed_only_when_saved() {
+        let draft = "one.example.com\n\n  two.example.com  \n";
+        assert_eq!(
+            parse_hidden_hosts(draft),
+            vec!["one.example.com", "two.example.com"]
+        );
+    }
 
     #[test]
     fn fixed_rule_dialog_does_not_grow_between_frames() {

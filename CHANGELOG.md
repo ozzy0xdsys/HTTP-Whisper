@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 - 2026-07-16
+
+- Keep the Disallowed domains editor as a persistent multiline draft while Settings is open.
+- Allow Enter and blank lines during editing, then normalize entries only when Settings is saved.
+
 ## 0.4.0 - 2026-07-16
 
 - Add a Start with Windows setting backed by the current-user Run registry key.
