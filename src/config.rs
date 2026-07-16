@@ -107,6 +107,8 @@ pub struct AppSettings {
     pub enable_https_interception: bool,
     pub auto_configure_system_proxy: bool,
     pub auto_install_ca: bool,
+    pub start_with_windows: bool,
+    pub auto_connect: bool,
     pub theme: String,
     pub autosave_interval_seconds: u64,
     pub body_memory_limit_bytes: usize,
@@ -124,6 +126,8 @@ impl Default for AppSettings {
             enable_https_interception: true,
             auto_configure_system_proxy: true,
             auto_install_ca: true,
+            start_with_windows: false,
+            auto_connect: false,
             theme: "system".to_owned(),
             autosave_interval_seconds: 30,
             body_memory_limit_bytes: 1_048_576,
@@ -271,6 +275,13 @@ mod tests {
         let rule: ResponseRewriteRule =
             serde_json::from_str(r#"{"find_text":"user","replace_text":"admin"}"#).unwrap();
         assert_eq!(rule.host, "*");
+    }
+
+    #[test]
+    fn startup_options_default_to_disabled_for_existing_settings() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.start_with_windows);
+        assert!(!settings.auto_connect);
     }
 
     #[test]

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 - 2026-07-16
+
+- Add a Start with Windows setting backed by the current-user Run registry key.
+- Add an Auto-connect setting that starts capture on the first UI frame after launch.
+- Refresh the registered startup executable path whenever the app runs or Settings are saved.
+
 ## 0.3.2 - 2026-07-16
 
 - Require a host match for every response rewrite.

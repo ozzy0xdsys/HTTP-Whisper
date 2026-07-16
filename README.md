@@ -9,6 +9,7 @@ HTTP Whisper is a native Windows HTTP, HTTPS, and WebSocket debugging proxy writ
 - Crash-recovery snapshot for interrupted Windows proxy changes
 - Automatic local CA generation and current-user Root store installation
 - Automatic Firefox system-proxy policy and enterprise-root trust
+- Optional current-user Windows startup registration and launch-time auto-connect
 - Local `mitm.it` certificate install page while capture is running
 - Live HTTP requests and responses with raw Authorization headers visible in the inspector
 - Live incoming and outgoing WebSocket messages
@@ -59,6 +60,12 @@ Click **Start Capture**. HTTP Whisper will:
 Firefox must be restarted after its enterprise policy is installed if it was already open. The automatic policy makes Firefox use the Windows system proxy and trust the Windows current-user Root store, so HSTS sites do not require or permit certificate exceptions. Some Windows accounts protect Firefox's policy registry; on those machines, the first capture shows a UAC prompt for this one-time Firefox integration step. Normal capture remains unelevated.
 
 With capture running, `http://mitm.it/` is handled locally by HTTP Whisper and serves the current HTTP Whisper CA as DER or PEM. If Firefox shows a public proxy warning page, Firefox is not using HTTP Whisper yet; accept the UAC prompt if shown, fully close Firefox, reopen it, and try `http://mitm.it/` again.
+
+## Startup
+
+Open **Tools > Settings** to enable **Start HTTP Whisper** and **Auto-connect** independently. Start HTTP Whisper adds the current executable to the current user's Windows startup registry entry without requiring administrator rights. Auto-connect starts capture immediately whenever the app launches, using the configured host, port, certificate, Firefox, and Windows proxy settings.
+
+Enable both options to launch HTTP Whisper at Windows sign-in and begin capturing automatically. Moving the executable is supported: the startup path is refreshed whenever HTTP Whisper runs or Settings are saved.
 
 ## Automatic Responses
 

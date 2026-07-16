@@ -1,6 +1,11 @@
 #[cfg(windows)]
 mod platform {
-    use std::{env, fs, os::windows::process::CommandExt, path::PathBuf, process::Command};
+    use std::{
+        env, fs,
+        os::windows::process::CommandExt,
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     use anyhow::{Context, Result, bail};
     use serde::{Deserialize, Serialize};
@@ -15,6 +20,8 @@ mod platform {
     use winreg::{RegKey, enums::*};
 
     const INTERNET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    const WINDOWS_RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    const STARTUP_VALUE: &str = "HTTP Whisper";
     const FIREFOX_PROXY: &str = r"Software\Policies\Mozilla\Firefox\Proxy";
     const FIREFOX_CERTIFICATES: &str = r"Software\Policies\Mozilla\Firefox\Certificates";
     const FIREFOX_HELPER_ARGUMENT: &str = "--install-firefox-integration";
@@ -190,6 +197,40 @@ mod platform {
         )
     }
 
+    pub fn configure_startup(enabled: bool) -> Result<()> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if enabled {
+            let executable = env::current_exe()
+                .context("cannot locate HTTP Whisper's executable for Windows startup")?;
+            let (run, _) = hkcu
+                .create_subkey(WINDOWS_RUN)
+                .context("cannot open the current user's Windows startup registry key")?;
+            run.set_value(STARTUP_VALUE, &startup_command(&executable))
+                .context("cannot add HTTP Whisper to Windows startup")?;
+        } else {
+            match hkcu.open_subkey_with_flags(WINDOWS_RUN, KEY_WRITE) {
+                Ok(run) => {
+                    if let Err(error) = run.delete_value(STARTUP_VALUE)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        return Err(error)
+                            .context("cannot remove HTTP Whisper from Windows startup");
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .context("cannot open the current user's Windows startup registry key");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn startup_command(executable: &Path) -> String {
+        format!(r#""{}""#, executable.display())
+    }
+
     fn ensure_firefox_integration() -> Result<()> {
         if firefox_integration_is_installed() {
             return Ok(());
@@ -331,7 +372,7 @@ mod platform {
 
         use anyhow::Context;
 
-        use super::{is_access_denied, powershell_literal};
+        use super::{is_access_denied, powershell_literal, startup_command};
 
         #[test]
         fn escapes_powershell_paths() {
@@ -347,6 +388,16 @@ mod platform {
                 .context("Firefox policy write failed")
                 .unwrap_err();
             assert!(is_access_denied(&error));
+        }
+
+        #[test]
+        fn quotes_windows_startup_executable_paths() {
+            assert_eq!(
+                startup_command(std::path::Path::new(
+                    r"C:\Program Files\HTTP Whisper\HTTP-Whisper.exe"
+                )),
+                r#""C:\Program Files\HTTP Whisper\HTTP-Whisper.exe""#
+            );
         }
     }
 }
@@ -382,6 +433,13 @@ mod platform {
     pub fn install_firefox_support() -> Result<()> {
         Ok(())
     }
+
+    pub fn configure_startup(_enabled: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
-pub use platform::{Manager as WindowsProxyManager, install_firefox_support, run_helper_from_args};
+pub use platform::{
+    Manager as WindowsProxyManager, configure_startup, install_firefox_support,
+    run_helper_from_args,
+};

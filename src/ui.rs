@@ -18,7 +18,7 @@ use crate::{
         WebSocketMessage, headers_as_text,
     },
     storage::SessionRepository,
-    windows_proxy::install_firefox_support,
+    windows_proxy::{configure_startup, install_firefox_support},
 };
 
 const XP_BG: Color32 = Color32::from_rgb(236, 233, 216);
@@ -49,6 +49,7 @@ pub struct HttpWhisperApp {
     events_rx: mpsc::Receiver<CaptureEvent>,
     repository: Option<SessionRepository>,
     worker: Option<CaptureWorker>,
+    auto_connect_pending: bool,
     sessions: Vec<Session>,
     selected: Option<Uuid>,
     filter: String,
@@ -64,6 +65,8 @@ pub struct HttpWhisperApp {
 impl HttpWhisperApp {
     pub fn new(cc: &eframe::CreationContext<'_>, settings: AppSettings) -> Self {
         configure_theme(&cc.egui_ctx);
+        let auto_connect_pending = settings.auto_connect;
+        let startup_error = configure_startup(settings.start_with_windows).err();
         let (events_tx, events_rx) = mpsc::channel();
         let repository = AppPaths::discover()
             .ok()
@@ -80,6 +83,7 @@ impl HttpWhisperApp {
             events_rx,
             repository,
             worker: None,
+            auto_connect_pending,
             sessions: sample_sessions(),
             selected: None,
             filter: String::new(),
@@ -88,7 +92,10 @@ impl HttpWhisperApp {
             state: "Idle".into(),
             ca_state: "Auto install".into(),
             activity: "Ready to start native Rust capture".into(),
-            status: "Ready - local proxy 127.0.0.1:8899".into(),
+            status: startup_error.map_or_else(
+                || "Ready - local proxy 127.0.0.1:8899".into(),
+                |error| format!("Windows startup setting could not be synchronized: {error}"),
+            ),
             errors: 0,
         }
     }
@@ -242,8 +249,32 @@ impl HttpWhisperApp {
     }
 
     fn save_settings(&mut self) {
-        self.settings = self.settings_draft.clone();
-        self.persist_settings("Settings saved");
+        let settings = self.settings_draft.clone();
+        match settings.save() {
+            Ok(()) => {
+                self.settings = settings;
+                if let Some(worker) = &self.worker {
+                    worker.update_settings(self.settings.clone());
+                }
+                match configure_startup(self.settings.start_with_windows) {
+                    Ok(()) => {
+                        self.activity = "Settings saved".into();
+                        self.status = "Settings saved".into();
+                        self.dialog = None;
+                    }
+                    Err(error) => {
+                        self.errors += 1;
+                        self.status = format!(
+                            "Settings saved, but Windows startup could not be updated: {error}"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                self.errors += 1;
+                self.status = error.to_string();
+            }
+        }
     }
 
     fn save_auto_rules(&mut self) {
@@ -632,7 +663,7 @@ impl HttpWhisperApp {
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
-            .default_size([470.0, 300.0])
+            .fixed_size([470.0, 360.0])
             .show(ui.ctx(), |ui| {
                 egui::Grid::new("settings-grid")
                     .num_columns(2)
@@ -664,6 +695,15 @@ impl HttpWhisperApp {
                             &mut self.settings_draft.auto_install_ca,
                             "Install automatically",
                         );
+                        ui.end_row();
+                        ui.label("Windows startup");
+                        ui.checkbox(
+                            &mut self.settings_draft.start_with_windows,
+                            "Start HTTP Whisper",
+                        );
+                        ui.end_row();
+                        ui.label("On launch");
+                        ui.checkbox(&mut self.settings_draft.auto_connect, "Auto-connect");
                         ui.end_row();
                     });
                 ui.separator();
@@ -909,7 +949,7 @@ impl HttpWhisperApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     ui.heading("HTTP Whisper");
-                    ui.label("Version 0.3.2");
+                    ui.label("Version 0.4.0");
                     ui.add_space(8.0);
                     ui.label("Native Rust HTTP/HTTPS and WebSocket debugging workbench");
                     ui.label("Classic Windows XP interface");
@@ -924,6 +964,9 @@ impl HttpWhisperApp {
 
 impl eframe::App for HttpWhisperApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if std::mem::take(&mut self.auto_connect_pending) {
+            self.start_capture();
+        }
         self.poll_events();
         if self.worker.as_ref().is_some_and(CaptureWorker::is_running) {
             ctx.request_repaint_after(Duration::from_millis(50));
