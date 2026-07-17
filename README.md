@@ -14,6 +14,7 @@ HTTP Whisper is a native Windows HTTP, HTTPS, and WebSocket debugging proxy writ
 - Live HTTP requests and responses with raw Authorization headers visible in the inspector
 - Live incoming and outgoing WebSocket messages
 - Binary WebSocket decoding for UTF-8, gzip, zlib, raw deflate, and zlib-stream
+- Interactive request and response breakpoints with editable traffic and Forward or Drop decisions
 - Host/path/method automatic response rules with wildcard and `re:` regular-expression matching
 - HTTP and decoded WebSocket text replacement rules with regex capture replacements
 - Case-sensitive and case-insensitive response replacements
@@ -67,6 +68,12 @@ With capture running, `http://mitm.it/` is handled locally by HTTP Whisper and s
 Open **File > Settings** to enable **Start HTTP Whisper** and **Auto-connect** independently. Start HTTP Whisper adds the current executable to the current user's Windows startup registry entry without requiring administrator rights. Auto-connect starts capture immediately whenever the app launches, using the configured host, port, certificate, Firefox, and Windows proxy settings.
 
 Enable both options to launch HTTP Whisper at Windows sign-in and begin capturing automatically. Moving the executable is supported: the startup path is refreshed whenever HTTP Whisper runs or Settings are saved.
+
+## Breakpoints
+
+Open **Tools > Breakpoints** to create request or response breakpoint rules. Rules can match Method, Host, Path, and response Status with wildcards or `re:` regular expressions, and can be disabled without deleting them.
+
+When a rule matches, HTTP Whisper opens the Paused view. Request breakpoints allow the URL and body to be edited; response breakpoints allow the status and body to be edited. Expand **Advanced** to edit headers. Choose **Forward** to continue with the edited traffic or **Drop** to block it. Multiple matches remain in the paused queue and can be handled independently.
 
 ## Automatic Responses
 

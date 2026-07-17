@@ -11,11 +11,12 @@ use uuid::Uuid;
 use crate::{
     capture::CaptureWorker,
     certificate::{install_current_user_ca, load_or_create_ca},
-    config::{AppPaths, AppSettings, AutoResponseRule, ResponseRewriteRule},
+    config::{AppPaths, AppSettings, AutoResponseRule, BreakpointRule, ResponseRewriteRule},
     filtering::matches_filter,
     model::{
-        CaptureEvent, CapturedExchange, CapturedRequest, CapturedResponse, Header, Session,
-        WebSocketMessage, headers_as_text,
+        BreakpointAction, BreakpointDecision, BreakpointPhase, CaptureEvent, CapturedExchange,
+        CapturedRequest, CapturedResponse, Header, PausedBreakpoint, Session, WebSocketMessage,
+        headers_as_text,
     },
     storage::SessionRepository,
     windows_proxy::{configure_startup, install_firefox_support},
@@ -34,8 +35,29 @@ enum DialogKind {
     Settings,
     AutoResponses,
     ResponseRewrites,
+    Breakpoints,
     Certificates,
     About,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BreakpointPage {
+    #[default]
+    Rules,
+    Paused,
+}
+
+#[derive(Clone, Debug)]
+struct PausedBreakpointEditor {
+    paused: PausedBreakpoint,
+    url: String,
+    body: String,
+    headers: String,
+    original_body: Vec<u8>,
+    original_body_text: String,
+    original_headers_text: String,
+    status: u16,
+    error: Option<String>,
 }
 
 pub struct HttpWhisperApp {
@@ -46,6 +68,11 @@ pub struct HttpWhisperApp {
     auto_selected: usize,
     rewrite_draft: Vec<ResponseRewriteRule>,
     rewrite_selected: usize,
+    breakpoint_draft: Vec<BreakpointRule>,
+    breakpoint_selected: usize,
+    breakpoint_page: BreakpointPage,
+    paused_breakpoints: Vec<PausedBreakpointEditor>,
+    paused_selected: usize,
     events_tx: mpsc::Sender<CaptureEvent>,
     events_rx: mpsc::Receiver<CaptureEvent>,
     repository: Option<SessionRepository>,
@@ -79,9 +106,14 @@ impl HttpWhisperApp {
             hidden_hosts_draft,
             auto_draft: settings.auto_response_rules.clone(),
             rewrite_draft: settings.response_rewrite_rules.clone(),
+            breakpoint_draft: settings.breakpoint_rules.clone(),
             settings,
             auto_selected: 0,
             rewrite_selected: 0,
+            breakpoint_selected: 0,
+            breakpoint_page: BreakpointPage::Rules,
+            paused_breakpoints: Vec::new(),
+            paused_selected: 0,
             events_tx,
             events_rx,
             repository,
@@ -133,6 +165,19 @@ impl HttpWhisperApp {
                     }
                     self.push_session(Session::Http(exchange));
                 }
+                CaptureEvent::BreakpointPaused(paused) => {
+                    self.activity = format!(
+                        "Paused {} at {}",
+                        paused.phase.label().to_ascii_lowercase(),
+                        paused.request.url()
+                    );
+                    self.status = format!("Breakpoint matched: {}", paused.rule_name);
+                    self.paused_breakpoints
+                        .push(PausedBreakpointEditor::new(paused));
+                    self.paused_selected = self.paused_breakpoints.len().saturating_sub(1);
+                    self.breakpoint_page = BreakpointPage::Paused;
+                    self.dialog = Some(DialogKind::Breakpoints);
+                }
                 CaptureEvent::ReplayCompleted(exchange) => {
                     self.activity = format!("Replay completed: {}", exchange.request.url());
                     self.status = exchange
@@ -171,6 +216,8 @@ impl HttpWhisperApp {
                     self.status = message;
                 }
                 CaptureEvent::Stopped(reason) => {
+                    self.paused_breakpoints.clear();
+                    self.paused_selected = 0;
                     self.state = "Idle".into();
                     self.activity = format!("Stopped: {reason}");
                     self.status = format!("Capture stopped: {reason}");
@@ -192,6 +239,7 @@ impl HttpWhisperApp {
             return;
         }
         self.sessions.clear();
+        self.paused_breakpoints.clear();
         self.selected = None;
         self.errors = 0;
         self.state = "Starting".into();
@@ -249,6 +297,15 @@ impl HttpWhisperApp {
                     .rewrite_selected
                     .min(self.rewrite_draft.len().saturating_sub(1));
             }
+            DialogKind::Breakpoints => {
+                self.breakpoint_draft = self.settings.breakpoint_rules.clone();
+                self.breakpoint_selected = self
+                    .breakpoint_selected
+                    .min(self.breakpoint_draft.len().saturating_sub(1));
+                if !self.paused_breakpoints.is_empty() {
+                    self.breakpoint_page = BreakpointPage::Paused;
+                }
+            }
             _ => {}
         }
         self.dialog = Some(kind);
@@ -296,6 +353,16 @@ impl HttpWhisperApp {
         self.persist_settings(&format!("{count} response rewrite rule(s) enabled"));
     }
 
+    fn save_breakpoint_rules(&mut self) {
+        self.settings.breakpoint_rules = self.breakpoint_draft.clone();
+        let count = self
+            .breakpoint_draft
+            .iter()
+            .filter(|rule| rule.enabled)
+            .count();
+        self.persist_settings(&format!("{count} breakpoint rule(s) enabled"));
+    }
+
     fn persist_settings(&mut self, message: &str) {
         match self.settings.save() {
             Ok(()) => {
@@ -310,6 +377,52 @@ impl HttpWhisperApp {
                 self.errors += 1;
                 self.status = error.to_string();
             }
+        }
+    }
+
+    fn resolve_selected_breakpoint(&mut self, action: BreakpointAction) {
+        let Some(editor) = self.paused_breakpoints.get(self.paused_selected) else {
+            self.status = "No paused traffic selected".into();
+            return;
+        };
+        let decision = match editor.decision(action) {
+            Ok(decision) => decision,
+            Err(error) => {
+                if let Some(editor) = self.paused_breakpoints.get_mut(self.paused_selected) {
+                    editor.error = Some(error.clone());
+                }
+                self.status = error;
+                return;
+            }
+        };
+        let Some(worker) = &self.worker else {
+            self.status = "Capture is no longer running".into();
+            self.paused_breakpoints.remove(self.paused_selected);
+            self.paused_selected = self
+                .paused_selected
+                .min(self.paused_breakpoints.len().saturating_sub(1));
+            return;
+        };
+        if worker.resolve_breakpoint(decision) {
+            let verb = match action {
+                BreakpointAction::Forward => "Forwarded",
+                BreakpointAction::Drop => "Dropped",
+            };
+            self.paused_breakpoints.remove(self.paused_selected);
+            self.paused_selected = self
+                .paused_selected
+                .min(self.paused_breakpoints.len().saturating_sub(1));
+            self.status = format!("{verb} paused traffic");
+            self.activity = format!(
+                "{} breakpoint decision applied",
+                self.paused_breakpoints.len()
+            );
+        } else {
+            self.status = "Paused traffic was already released".into();
+            self.paused_breakpoints.remove(self.paused_selected);
+            self.paused_selected = self
+                .paused_selected
+                .min(self.paused_breakpoints.len().saturating_sub(1));
         }
     }
 
@@ -401,6 +514,10 @@ impl HttpWhisperApp {
                             self.open_dialog(DialogKind::ResponseRewrites);
                             ui.close();
                         }
+                        if ui.button("Breakpoints...").clicked() {
+                            self.open_dialog(DialogKind::Breakpoints);
+                            ui.close();
+                        }
                         if ui.button("Certificate Manager...").clicked() {
                             self.open_dialog(DialogKind::Certificates);
                             ui.close();
@@ -443,6 +560,14 @@ impl HttpWhisperApp {
                     if ui.add(toolbar_button("Response Rewrites")).clicked() {
                         self.open_dialog(DialogKind::ResponseRewrites);
                     }
+                    let breakpoint_label = if self.paused_breakpoints.is_empty() {
+                        "Breakpoints".to_owned()
+                    } else {
+                        format!("Breakpoints ({})", self.paused_breakpoints.len())
+                    };
+                    if ui.add(toolbar_button(&breakpoint_label)).clicked() {
+                        self.open_dialog(DialogKind::Breakpoints);
+                    }
                     if ui.add(toolbar_button("Certificates")).clicked() {
                         self.open_dialog(DialogKind::Certificates);
                     }
@@ -465,6 +590,12 @@ impl HttpWhisperApp {
             metric(ui, "HTTPS CA", &self.ca_state, 115.0);
             metric(ui, "Sessions", &self.sessions.len().to_string(), 72.0);
             metric(ui, "Errors", &self.errors.to_string(), 65.0);
+            metric(
+                ui,
+                "Paused",
+                &self.paused_breakpoints.len().to_string(),
+                65.0,
+            );
             let remaining = ui.available_width().max(180.0);
             group_box(ui, "Activity", Vec2::new(remaining, 49.0), |ui| {
                 ui.add(egui::Label::new(&self.activity).truncate());
@@ -661,6 +792,7 @@ impl HttpWhisperApp {
             DialogKind::Settings => self.settings_dialog(ui),
             DialogKind::AutoResponses => self.auto_responses_dialog(ui),
             DialogKind::ResponseRewrites => self.response_rewrites_dialog(ui),
+            DialogKind::Breakpoints => self.breakpoints_dialog(ui),
             DialogKind::Certificates => self.certificates_dialog(ui),
             DialogKind::About => self.about_dialog(ui),
         }
@@ -905,6 +1037,240 @@ impl HttpWhisperApp {
             });
     }
 
+    fn breakpoints_dialog(&mut self, ui: &mut Ui) {
+        egui::Window::new("Breakpoints")
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([850.0, 560.0])
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.breakpoint_page, BreakpointPage::Rules, "Rules");
+                    ui.selectable_value(
+                        &mut self.breakpoint_page,
+                        BreakpointPage::Paused,
+                        format!("Paused ({})", self.paused_breakpoints.len()),
+                    );
+                });
+                ui.separator();
+                match self.breakpoint_page {
+                    BreakpointPage::Rules => self.breakpoint_rules_view(ui),
+                    BreakpointPage::Paused => self.paused_breakpoints_view(ui),
+                }
+            });
+    }
+
+    fn breakpoint_rules_view(&mut self, ui: &mut Ui) {
+        let left_width = 245.0;
+        let gap = 8.0;
+        let right_width = (ui.available_width() - left_width - gap).max(430.0);
+        ui.horizontal_top(|ui| {
+            fixed_group_box(ui, "Rules", Vec2::new(left_width, 455.0), |ui| {
+                ScrollArea::vertical().max_height(375.0).show(ui, |ui| {
+                    for (index, rule) in self.breakpoint_draft.iter().enumerate() {
+                        let state = if rule.enabled { "On" } else { "Off" };
+                        let label = format!(
+                            "{state}  {}  {}  {}",
+                            rule.phase.label(),
+                            compact_rule_text(&rule.host),
+                            compact_rule_text(&rule.path)
+                        );
+                        if ui
+                            .selectable_label(self.breakpoint_selected == index, label)
+                            .clicked()
+                        {
+                            self.breakpoint_selected = index;
+                        }
+                    }
+                });
+                if ui.button("New").clicked() {
+                    let rule = BreakpointRule {
+                        name: format!("Breakpoint {}", self.breakpoint_draft.len() + 1),
+                        ..Default::default()
+                    };
+                    self.breakpoint_draft.push(rule);
+                    self.breakpoint_selected = self.breakpoint_draft.len() - 1;
+                }
+                if ui.button("Delete").clicked() && !self.breakpoint_draft.is_empty() {
+                    self.breakpoint_draft.remove(self.breakpoint_selected);
+                    self.breakpoint_selected = self
+                        .breakpoint_selected
+                        .min(self.breakpoint_draft.len().saturating_sub(1));
+                }
+            });
+            ui.add_space(gap);
+            fixed_group_box(
+                ui,
+                "Selected Breakpoint",
+                Vec2::new(right_width, 455.0),
+                |ui| {
+                    if let Some(rule) = self.breakpoint_draft.get_mut(self.breakpoint_selected) {
+                        rule_form_row(ui, "Name", |ui| {
+                            ui.text_edit_singleline(&mut rule.name);
+                        });
+                        rule_form_row(ui, "", |ui| {
+                            ui.checkbox(&mut rule.enabled, "Enabled");
+                        });
+                        rule_form_row(ui, "Phase", |ui| {
+                            egui::ComboBox::from_id_salt("breakpoint-phase")
+                                .selected_text(rule.phase.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut rule.phase,
+                                        BreakpointPhase::Request,
+                                        "Request",
+                                    );
+                                    ui.selectable_value(
+                                        &mut rule.phase,
+                                        BreakpointPhase::Response,
+                                        "Response",
+                                    );
+                                });
+                        });
+                        rule_form_row(ui, "Method", |ui| {
+                            ui.text_edit_singleline(&mut rule.method);
+                        });
+                        rule_form_row(ui, "Host", |ui| {
+                            ui.text_edit_singleline(&mut rule.host);
+                        });
+                        rule_form_row(ui, "Path", |ui| {
+                            ui.text_edit_singleline(&mut rule.path);
+                        });
+                        rule_form_row(ui, "Status", |ui| {
+                            ui.add_enabled_ui(rule.phase == BreakpointPhase::Response, |ui| {
+                                ui.text_edit_singleline(&mut rule.status);
+                            });
+                        });
+                    } else {
+                        ui.label("Create a breakpoint to begin.");
+                    }
+                },
+            );
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Close").clicked() {
+                self.dialog = None;
+            }
+            if ui.button("Save").clicked() {
+                self.save_breakpoint_rules();
+            }
+        });
+    }
+
+    fn paused_breakpoints_view(&mut self, ui: &mut Ui) {
+        let left_width = 245.0;
+        let gap = 8.0;
+        let right_width = (ui.available_width() - left_width - gap).max(430.0);
+        let mut action = None;
+        ui.horizontal_top(|ui| {
+            fixed_group_box(ui, "Paused Traffic", Vec2::new(left_width, 455.0), |ui| {
+                ScrollArea::vertical().max_height(410.0).show(ui, |ui| {
+                    for (index, editor) in self.paused_breakpoints.iter().enumerate() {
+                        let label = format!(
+                            "{}  {}  {}",
+                            editor.paused.phase.label(),
+                            editor.paused.request.method,
+                            compact_rule_text(&editor.paused.request.url())
+                        );
+                        if ui
+                            .selectable_label(self.paused_selected == index, label)
+                            .clicked()
+                        {
+                            self.paused_selected = index;
+                        }
+                    }
+                });
+            });
+            ui.add_space(gap);
+            fixed_group_box(
+                ui,
+                "Breakpoint Editor",
+                Vec2::new(right_width, 455.0),
+                |ui| {
+                    let Some(editor) = self.paused_breakpoints.get_mut(self.paused_selected) else {
+                        ui.label("No traffic is currently paused.");
+                        return;
+                    };
+                    ScrollArea::vertical()
+                        .id_salt(("paused-breakpoint-editor", editor.paused.id))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} - {}",
+                                    editor.paused.phase.label(),
+                                    editor.paused.rule_name
+                                ))
+                                .strong(),
+                            );
+                            ui.add_space(3.0);
+                            rule_form_row(ui, "URL", |ui| {
+                                ui.add_enabled(
+                                    editor.paused.phase == BreakpointPhase::Request,
+                                    TextEdit::singleline(&mut editor.url)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                            if editor.paused.phase == BreakpointPhase::Response {
+                                rule_form_row(ui, "Status", |ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut editor.status).range(100..=599),
+                                    );
+                                });
+                            }
+                            ui.label("Body");
+                            scrollable_text_editor(
+                                ui,
+                                ("breakpoint-body", editor.paused.id),
+                                &mut editor.body,
+                                170.0,
+                            );
+                            egui::CollapsingHeader::new("Advanced")
+                                .id_salt(("breakpoint-advanced", editor.paused.id))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    ui.label("Headers");
+                                    scrollable_text_editor(
+                                        ui,
+                                        ("breakpoint-headers", editor.paused.id),
+                                        &mut editor.headers,
+                                        130.0,
+                                    );
+                                });
+                            if let Some(error) = &editor.error {
+                                ui.colored_label(Color32::from_rgb(160, 0, 0), error);
+                            }
+                        });
+                },
+            );
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Close").clicked() {
+                self.dialog = None;
+            }
+            if ui
+                .add_enabled(
+                    !self.paused_breakpoints.is_empty(),
+                    egui::Button::new("Drop"),
+                )
+                .clicked()
+            {
+                action = Some(BreakpointAction::Drop);
+            }
+            if ui
+                .add_enabled(
+                    !self.paused_breakpoints.is_empty(),
+                    egui::Button::new("Forward"),
+                )
+                .clicked()
+            {
+                action = Some(BreakpointAction::Forward);
+            }
+        });
+        if let Some(action) = action {
+            self.resolve_selected_breakpoint(action);
+        }
+    }
+
     fn certificates_dialog(&mut self, ui: &mut Ui) {
         egui::Window::new("Certificate Manager")
             .collapsible(false).resizable(false).default_size([500.0, 245.0])
@@ -948,7 +1314,7 @@ impl HttpWhisperApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     ui.heading("HTTP Whisper");
-                    ui.label("Version 0.5.1");
+                    ui.label("Version 0.6.0");
                     ui.add_space(8.0);
                     ui.label("Native Rust HTTP/HTTPS and WebSocket debugging workbench");
                     ui.label("Classic Windows XP interface");
@@ -1089,7 +1455,7 @@ fn configure_theme(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Light);
 }
 
-fn toolbar_button(text: &'static str) -> egui::Button<'static> {
+fn toolbar_button(text: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(text).strong()).min_size(Vec2::new(88.0, 25.0))
 }
 
@@ -1200,6 +1566,143 @@ fn scrollable_text_editor(
         })
         .inner
         .changed()
+}
+
+impl PausedBreakpointEditor {
+    fn new(paused: PausedBreakpoint) -> Self {
+        let (original_body, headers, status) = match paused.phase {
+            BreakpointPhase::Request => (
+                paused.request.body.clone(),
+                headers_as_text(&paused.request.headers),
+                200,
+            ),
+            BreakpointPhase::Response => paused.response.as_ref().map_or_else(
+                || (Vec::new(), String::new(), 200),
+                |response| {
+                    (
+                        response.body.clone(),
+                        headers_as_text(&response.headers),
+                        response.status,
+                    )
+                },
+            ),
+        };
+        let body = String::from_utf8_lossy(&original_body).into_owned();
+        Self {
+            url: paused.request.url(),
+            paused,
+            original_body,
+            original_body_text: body.clone(),
+            original_headers_text: headers.clone(),
+            body,
+            headers,
+            status,
+            error: None,
+        }
+    }
+
+    fn decision(&self, action: BreakpointAction) -> Result<BreakpointDecision, String> {
+        let mut request = self.paused.request.clone();
+        let mut response = self.paused.response.clone();
+        if action == BreakpointAction::Forward {
+            match self.paused.phase {
+                BreakpointPhase::Request => {
+                    update_request_url(&mut request, &self.url)?;
+                    if self.headers != self.original_headers_text {
+                        request.headers = parse_headers_editor(&self.headers)?;
+                    }
+                    request.body = if self.body == self.original_body_text {
+                        self.original_body.clone()
+                    } else {
+                        self.body.as_bytes().to_vec()
+                    };
+                }
+                BreakpointPhase::Response => {
+                    let edited = response
+                        .as_mut()
+                        .ok_or_else(|| "Paused response is unavailable".to_owned())?;
+                    if !(100..=599).contains(&self.status) {
+                        return Err("Response status must be between 100 and 599".into());
+                    }
+                    edited.status = self.status;
+                    edited.reason = hudsucker::hyper::StatusCode::from_u16(self.status)
+                        .ok()
+                        .and_then(|status| status.canonical_reason())
+                        .unwrap_or("")
+                        .into();
+                    if self.headers != self.original_headers_text {
+                        edited.headers = parse_headers_editor(&self.headers)?;
+                    }
+                    edited.body = if self.body == self.original_body_text {
+                        self.original_body.clone()
+                    } else {
+                        self.body.as_bytes().to_vec()
+                    };
+                }
+            }
+        }
+        Ok(BreakpointDecision {
+            id: self.paused.id,
+            action,
+            request,
+            response,
+        })
+    }
+}
+
+fn update_request_url(request: &mut CapturedRequest, value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value).map_err(|error| format!("URL is invalid: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("URL scheme must be http or https".into());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL must include a host".to_owned())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "URL must include a valid port".to_owned())?;
+    let mut path = url.path().to_owned();
+    if let Some(query) = url.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    request.scheme = url.scheme().to_owned();
+    request.host = host.to_owned();
+    request.port = port;
+    request.path = path;
+    Ok(())
+}
+
+fn parse_headers_editor(text: &str) -> Result<Vec<Header>, String> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = line.trim_end_matches('\r');
+            if line.trim().is_empty() {
+                return None;
+            }
+            Some((index, line))
+        })
+        .map(|(index, line)| {
+            let (name, value) = line
+                .split_once(':')
+                .ok_or_else(|| format!("Header line {} must contain ':'", index + 1))?;
+            let name = name.trim();
+            let value = value.trim();
+            hudsucker::hyper::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                format!("Header line {} has an invalid name: {error}", index + 1)
+            })?;
+            value
+                .parse::<hudsucker::hyper::header::HeaderValue>()
+                .map_err(|error| {
+                    format!("Header line {} has an invalid value: {error}", index + 1)
+                })?;
+            Ok(Header {
+                name: name.to_owned(),
+                value: value.to_owned(),
+            })
+        })
+        .collect()
 }
 
 fn compact_rule_text(text: &str) -> String {
@@ -1471,6 +1974,32 @@ fn sample_sessions() -> Vec<Session> {
 mod tests {
     use super::*;
 
+    fn paused_request() -> PausedBreakpoint {
+        PausedBreakpoint {
+            id: Uuid::new_v4(),
+            rule_name: "Edit login".into(),
+            phase: BreakpointPhase::Request,
+            request: CapturedRequest {
+                method: "POST".into(),
+                scheme: "https".into(),
+                host: "api.example.com".into(),
+                port: 443,
+                path: "/login".into(),
+                version: "HTTP/1.1".into(),
+                headers: vec![Header {
+                    name: "Authorization".into(),
+                    value: "Bearer old".into(),
+                }],
+                body: b"old body".to_vec(),
+                timestamp: Utc::now(),
+                client_addr: "127.0.0.1:50000".into(),
+                process: "firefox.exe".into(),
+                pid: Some(42),
+            },
+            response: None,
+        }
+    }
+
     #[test]
     fn disallowed_domains_are_parsed_only_when_saved() {
         let draft = "one.example.com\n\n  two.example.com  \n";
@@ -1478,6 +2007,40 @@ mod tests {
             parse_hidden_hosts(draft),
             vec!["one.example.com", "two.example.com"]
         );
+    }
+
+    #[test]
+    fn breakpoint_editor_updates_url_body_and_advanced_headers() {
+        let mut editor = PausedBreakpointEditor::new(paused_request());
+        editor.url = "http://localhost:8080/admin?preview=1".into();
+        editor.body = "new body".into();
+        editor.headers = "Authorization: Bearer new\nX-Debug: enabled".into();
+
+        let decision = editor.decision(BreakpointAction::Forward).unwrap();
+        assert_eq!(decision.request.scheme, "http");
+        assert_eq!(decision.request.host, "localhost");
+        assert_eq!(decision.request.port, 8080);
+        assert_eq!(decision.request.path, "/admin?preview=1");
+        assert_eq!(decision.request.body, b"new body");
+        assert_eq!(decision.request.headers.len(), 2);
+        assert_eq!(decision.request.headers[0].value, "Bearer new");
+    }
+
+    #[test]
+    fn breakpoint_editor_rejects_malformed_advanced_headers() {
+        let mut editor = PausedBreakpointEditor::new(paused_request());
+        editor.headers = "not a header".into();
+        assert!(editor.decision(BreakpointAction::Forward).is_err());
+        assert!(editor.decision(BreakpointAction::Drop).is_ok());
+    }
+
+    #[test]
+    fn breakpoint_editor_preserves_untouched_binary_body() {
+        let mut paused = paused_request();
+        paused.request.body = vec![0xff, 0x00, 0xfe, 0x41];
+        let editor = PausedBreakpointEditor::new(paused);
+        let decision = editor.decision(BreakpointAction::Forward).unwrap();
+        assert_eq!(decision.request.body, vec![0xff, 0x00, 0xfe, 0x41]);
     }
 
     #[test]
@@ -1511,6 +2074,71 @@ mod tests {
                         });
                     })
                     .expect("rule window should be visible");
+                size = window.response.rect.size();
+            });
+            sizes.push(size);
+        }
+
+        let stable_size = sizes[2];
+        for size in &sizes[3..] {
+            assert_eq!(*size, stable_size);
+        }
+    }
+
+    #[test]
+    fn breakpoint_dialog_does_not_grow_with_advanced_headers_open() {
+        let context = egui::Context::default();
+        let mut body = "body line\n".repeat(500);
+        let mut headers = "X-Long-Header: value\n".repeat(300);
+        let mut sizes = Vec::new();
+
+        for frame in 0..8 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1200.0, 800.0),
+                )),
+                time: Some(frame as f64 / 60.0),
+                ..Default::default()
+            };
+            let mut size = Vec2::ZERO;
+            let _ = context.run_ui(input, |ui| {
+                let window = egui::Window::new("Breakpoint Layout Test")
+                    .collapsible(false)
+                    .resizable(false)
+                    .fixed_size([850.0, 560.0])
+                    .show(ui.ctx(), |ui| {
+                        ui.horizontal_top(|ui| {
+                            fixed_group_box(ui, "Paused Traffic", Vec2::new(245.0, 455.0), |_| {});
+                            ui.add_space(8.0);
+                            fixed_group_box(
+                                ui,
+                                "Breakpoint Editor",
+                                Vec2::new(565.0, 455.0),
+                                |ui| {
+                                    ScrollArea::vertical().show(ui, |ui| {
+                                        scrollable_text_editor(
+                                            ui,
+                                            "breakpoint-layout-body",
+                                            &mut body,
+                                            170.0,
+                                        );
+                                        egui::CollapsingHeader::new("Advanced")
+                                            .default_open(true)
+                                            .show(ui, |ui| {
+                                                scrollable_text_editor(
+                                                    ui,
+                                                    "breakpoint-layout-headers",
+                                                    &mut headers,
+                                                    130.0,
+                                                );
+                                            });
+                                    });
+                                },
+                            );
+                        });
+                    })
+                    .expect("breakpoint window should be visible");
                 size = window.response.rect.size();
             });
             sizes.push(size);

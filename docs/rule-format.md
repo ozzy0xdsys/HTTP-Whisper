@@ -27,9 +27,23 @@ Response rewrite example:
 }
 ```
 
+Breakpoint example:
+
+```json
+{
+  "name": "Pause failed API responses",
+  "enabled": true,
+  "phase": "response",
+  "method": "re:^(GET|POST)$",
+  "host": "api.example.com",
+  "path": "/api/*",
+  "status": "re:^4\\d\\d$"
+}
+```
+
 Automatic-response host matching is case-insensitive and path matching is case-sensitive. An empty automatic-response method matches every method. Host and path fields support `*` wildcards.
 
-Prefix a match value with `re:` to use a regular expression. This notation works in the filter bar, Hidden Hosts list, automatic-response Method, Host, and Path fields, and response-rewrite Host and Find fields. For example:
+Prefix a match value with `re:` to use a regular expression. This notation works in the filter bar, Hidden Hosts list, automatic-response Method, Host, and Path fields, response-rewrite Host and Find fields, and every breakpoint match field. For example:
 
 ```text
 Method: re:^(GET|POST)$
@@ -37,6 +51,9 @@ Host: re:^api\d+\.example\.com$
 Path: re:^/users/\d+$
 Find: re:"user_id":\s*(\d+)
 Replace: "account_id": $1
+Status: re:^(4|5)\d\d$
 ```
+
+Breakpoint request rules use Method, Host, and Path. Response rules can additionally match Status. An empty Method or Status matches every value, while an enabled switch temporarily disables a rule without removing it.
 
 Response rewrites require a host and apply to every textual HTTP response and decoded WebSocket message for matching hosts, without method or path restrictions. Host matching is case-insensitive and supports `*` wildcards. Replace supports `$1` and `${name}` capture references. Find matching is case-sensitive by default; use an inline flag such as `re:(?i)user123` for case-insensitive matching. Values without the `re:` prefix retain their existing wildcard or plain-text behavior.

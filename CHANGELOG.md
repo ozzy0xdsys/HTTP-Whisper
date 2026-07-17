@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0 - 2026-07-17
+
+- Add interactive request and response breakpoints with method, host, path, and status matching.
+- Add a live paused-traffic queue with editable request URLs, bodies, and response statuses.
+- Add request and response header editing under a collapsed Advanced section.
+- Add Forward and Drop decisions, plus enabled switches for temporarily disabling rules.
+- Support wildcard and `re:` regular-expression notation in every breakpoint match field.
+
 ## 0.5.1 - 2026-07-17
 
 - Remove the Refined XP interface and its style selector.

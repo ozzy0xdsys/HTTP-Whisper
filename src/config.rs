@@ -4,7 +4,52 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::rules::{regex_notation_error, regex_source};
+use crate::{
+    model::BreakpointPhase,
+    rules::{regex_notation_error, regex_source},
+};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct BreakpointRule {
+    pub name: String,
+    pub enabled: bool,
+    pub phase: BreakpointPhase,
+    pub method: String,
+    pub host: String,
+    pub path: String,
+    pub status: String,
+}
+
+impl BreakpointRule {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.name.trim().is_empty(), "breakpoint name is required");
+        anyhow::ensure!(!self.host.trim().is_empty(), "breakpoint host is required");
+        anyhow::ensure!(
+            self.path.starts_with('/') || regex_source(&self.path).is_some(),
+            "breakpoint path must start with / or re:"
+        );
+        validate_regex_field("breakpoint method", &self.method)?;
+        validate_regex_field("breakpoint host", &self.host)?;
+        validate_regex_field("breakpoint path", &self.path)?;
+        validate_regex_field("breakpoint status", &self.status)?;
+        Ok(())
+    }
+}
+
+impl Default for BreakpointRule {
+    fn default() -> Self {
+        Self {
+            name: "Breakpoint 1".to_owned(),
+            enabled: false,
+            phase: BreakpointPhase::Request,
+            method: String::new(),
+            host: "api.example.com".to_owned(),
+            path: "/api/*".to_owned(),
+            status: String::new(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -116,6 +161,7 @@ pub struct AppSettings {
     pub hidden_hosts: Vec<String>,
     pub auto_response_rules: Vec<AutoResponseRule>,
     pub response_rewrite_rules: Vec<ResponseRewriteRule>,
+    pub breakpoint_rules: Vec<BreakpointRule>,
 }
 
 impl Default for AppSettings {
@@ -135,6 +181,7 @@ impl Default for AppSettings {
             hidden_hosts: vec!["detectportal.firefox.com".to_owned()],
             auto_response_rules: Vec::new(),
             response_rewrite_rules: Vec::new(),
+            breakpoint_rules: Vec::new(),
         }
     }
 }
@@ -197,6 +244,9 @@ impl AppSettings {
             rule.validate()?;
         }
         for rule in &self.response_rewrite_rules {
+            rule.validate()?;
+        }
+        for rule in &self.breakpoint_rules {
             rule.validate()?;
         }
         Ok(())
@@ -282,6 +332,7 @@ mod tests {
         let settings: AppSettings = serde_json::from_str("{}").unwrap();
         assert!(!settings.start_with_windows);
         assert!(!settings.auto_connect);
+        assert!(settings.breakpoint_rules.is_empty());
     }
 
     #[test]
@@ -289,6 +340,16 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.auto_response_rules.push(AutoResponseRule {
             host: "re:(unclosed".into(),
+            ..Default::default()
+        });
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_breakpoint_regex() {
+        let mut settings = AppSettings::default();
+        settings.breakpoint_rules.push(BreakpointRule {
+            status: "re:(unclosed".into(),
             ..Default::default()
         });
         assert!(settings.validate().is_err());

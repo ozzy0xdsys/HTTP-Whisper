@@ -26,7 +26,7 @@ use hudsucker::{
     rustls::crypto::aws_lc_rs,
     tokio_tungstenite::tungstenite::Message,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -34,10 +34,13 @@ use crate::{
     certificate::{install_current_user_ca, load_or_create_ca},
     config::{AppPaths, AppSettings},
     model::{
-        CaptureEvent, CapturedExchange, CapturedRequest, CapturedResponse, Direction, Header,
-        Headers, WebSocketMessage,
+        BreakpointAction, BreakpointDecision, BreakpointPhase, CaptureEvent, CapturedExchange,
+        CapturedRequest, CapturedResponse, Direction, Header, Headers, PausedBreakpoint,
+        WebSocketMessage,
     },
-    rules::{apply_rewrite, find_auto_response, host_is_hidden, matching_rewrites},
+    rules::{
+        apply_rewrite, find_auto_response, find_breakpoint, host_is_hidden, matching_rewrites,
+    },
     storage::BodyStore,
     windows_proxy::WindowsProxyManager,
 };
@@ -48,6 +51,7 @@ pub struct CaptureWorker {
     stop: Option<oneshot::Sender<()>>,
     join: Option<thread::JoinHandle<()>>,
     settings: Arc<RwLock<AppSettings>>,
+    breakpoints: BreakpointController,
 }
 
 impl CaptureWorker {
@@ -55,10 +59,14 @@ impl CaptureWorker {
         let (stop_tx, stop_rx) = oneshot::channel();
         let shared_settings = Arc::new(RwLock::new(settings));
         let worker_settings = Arc::clone(&shared_settings);
+        let breakpoints = BreakpointController::default();
+        let worker_breakpoints = breakpoints.clone();
         let join = thread::Builder::new()
             .name("http-whisper-capture".into())
             .spawn(move || {
-                if let Err(error) = run_capture(worker_settings, events.clone(), stop_rx) {
+                if let Err(error) =
+                    run_capture(worker_settings, worker_breakpoints, events.clone(), stop_rx)
+                {
                     let _ = events.send(CaptureEvent::Error(error.to_string()));
                 }
             })?;
@@ -66,6 +74,7 @@ impl CaptureWorker {
             stop: Some(stop_tx),
             join: Some(join),
             settings: shared_settings,
+            breakpoints,
         })
     }
 
@@ -74,9 +83,14 @@ impl CaptureWorker {
     }
 
     pub fn stop(&mut self) {
+        self.breakpoints.cancel_all();
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
+    }
+
+    pub fn resolve_breakpoint(&self, decision: BreakpointDecision) -> bool {
+        self.breakpoints.resolve(decision)
     }
 
     pub fn is_running(&self) -> bool {
@@ -99,6 +113,7 @@ impl Drop for CaptureWorker {
 
 fn run_capture(
     settings: Arc<RwLock<AppSettings>>,
+    breakpoints: BreakpointController,
     events: mpsc::Sender<CaptureEvent>,
     stop_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
@@ -164,6 +179,7 @@ fn run_capture(
             body_store: BodyStore::new(paths.bodies_dir)?,
             ca_der,
             ca_pem,
+            breakpoints,
         };
         let http_handler = TrafficHandler::new(shared.clone());
         let websocket_handler = WebSocketTrafficHandler::new(shared);
@@ -206,11 +222,58 @@ struct SharedCapture {
     body_store: BodyStore,
     ca_der: Arc<Vec<u8>>,
     ca_pem: Arc<Vec<u8>>,
+    breakpoints: BreakpointController,
 }
 
 impl SharedCapture {
     fn next_sequence(&self) -> u64 {
         self.sequence.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    async fn pause_at_breakpoint(
+        &self,
+        rule_name: String,
+        phase: BreakpointPhase,
+        request: CapturedRequest,
+        response: Option<CapturedResponse>,
+    ) -> Option<BreakpointDecision> {
+        let id = Uuid::new_v4();
+        let (decision_tx, decision_rx) = oneshot::channel();
+        self.breakpoints.waiters.lock().insert(id, decision_tx);
+        let paused = PausedBreakpoint {
+            id,
+            rule_name,
+            phase,
+            request,
+            response,
+        };
+        if self
+            .events
+            .send(CaptureEvent::BreakpointPaused(paused))
+            .is_err()
+        {
+            self.breakpoints.waiters.lock().remove(&id);
+            return None;
+        }
+        decision_rx.await.ok()
+    }
+}
+
+#[derive(Clone, Default)]
+struct BreakpointController {
+    waiters: Arc<Mutex<HashMap<Uuid, oneshot::Sender<BreakpointDecision>>>>,
+}
+
+impl BreakpointController {
+    fn resolve(&self, decision: BreakpointDecision) -> bool {
+        self.waiters
+            .lock()
+            .remove(&decision.id)
+            .is_some_and(|waiter| waiter.send(decision).is_ok())
+    }
+
+    fn cancel_all(&self) {
+        self.waiters.lock().clear();
     }
 }
 
@@ -266,8 +329,8 @@ impl HttpHandler for TrafficHandler {
         } else {
             request
         };
-        let (parts, body) = request.into_parts();
-        let body = match body.collect().await {
+        let (mut parts, body) = request.into_parts();
+        let mut body = match body.collect().await {
             Ok(value) => value.to_bytes().to_vec(),
             Err(error) => {
                 let _ = self.shared.events.send(CaptureEvent::Error(format!(
@@ -276,7 +339,7 @@ impl HttpHandler for TrafficHandler {
                 Vec::new()
             }
         };
-        let captured = request_from_parts(&parts, body.clone(), context);
+        let mut captured = request_from_parts(&parts, body.clone(), context);
         let settings = self.shared.settings.read().clone();
         let hidden = host_is_hidden(&captured.host, &settings.hidden_hosts);
         let rule = find_auto_response(
@@ -333,11 +396,89 @@ impl HttpHandler for TrafficHandler {
                 .unwrap_or_else(|_| Response::new(Body::from("invalid automatic response")));
             return RequestOrResponse::Response(response);
         }
+
+        let mut breakpoint_match = None;
+        if !hidden
+            && let Some(rule) = find_breakpoint(
+                BreakpointPhase::Request,
+                &captured.method,
+                &captured.host,
+                path_without_query(&captured.path),
+                None,
+                &settings.breakpoint_rules,
+            )
+            .cloned()
+        {
+            let rule_label = format!("Breakpoint: {}", rule.name);
+            let decision = self
+                .shared
+                .pause_at_breakpoint(
+                    rule.name.clone(),
+                    BreakpointPhase::Request,
+                    captured.clone(),
+                    None,
+                )
+                .await;
+            if let Some(decision) = decision {
+                match decision.action {
+                    BreakpointAction::Forward => {
+                        if let Err(error) = apply_edited_request(
+                            &mut parts,
+                            &mut body,
+                            &mut captured,
+                            decision.request,
+                        ) {
+                            let message = format!("Could not apply breakpoint request: {error}");
+                            let _ = self
+                                .shared
+                                .events
+                                .send(CaptureEvent::Error(message.clone()));
+                            return RequestOrResponse::Response(proxy_error_response(&message));
+                        }
+                        breakpoint_match = Some(rule_label);
+                    }
+                    BreakpointAction::Drop => {
+                        let response_body = b"Dropped by HTTP Whisper request breakpoint".to_vec();
+                        if !hidden {
+                            let response = CapturedResponse {
+                                status: StatusCode::FORBIDDEN.as_u16(),
+                                reason: "Forbidden".into(),
+                                version: "HTTP/1.1".into(),
+                                headers: vec![Header {
+                                    name: "content-type".into(),
+                                    value: "text/plain; charset=utf-8".into(),
+                                }],
+                                body: response_body.clone(),
+                                duration_ms: 0.0,
+                            };
+                            let _ = self.shared.body_store.put(&captured.body);
+                            let _ = self.shared.body_store.put(&response_body);
+                            let exchange = CapturedExchange {
+                                id: Uuid::new_v4(),
+                                sequence: self.shared.next_sequence(),
+                                request: captured,
+                                response: Some(response),
+                                rule_matched: Some(rule_label),
+                                error: Some("Dropped at request breakpoint".into()),
+                                synthetic: true,
+                                pinned: false,
+                                notes: "Dropped at request breakpoint".into(),
+                            };
+                            let _ = self.shared.events.send(CaptureEvent::Exchange(exchange));
+                        }
+                        return RequestOrResponse::Response(breakpoint_drop_response(
+                            StatusCode::FORBIDDEN,
+                            response_body,
+                        ));
+                    }
+                }
+            }
+        }
         self.pending = Some(PendingRequest {
             request: captured,
             started: Instant::now(),
             synthetic: false,
-            rule_matched: None,
+            rule_matched: breakpoint_match,
         });
         let request = Request::from_parts(parts, Body::from(body));
         RequestOrResponse::Request(request)
@@ -399,13 +540,79 @@ impl HttpHandler for TrafficHandler {
         }
 
         if let Some(pending) = self.pending.take() {
-            let settings = self.shared.settings.read();
-            if !host_is_hidden(&pending.request.host, &settings.hidden_hosts) {
-                let captured_response = response_from_parts(
-                    &parts,
-                    body.clone(),
-                    pending.started.elapsed().as_secs_f64() * 1000.0,
-                );
+            let settings = self.shared.settings.read().clone();
+            let hidden = host_is_hidden(&pending.request.host, &settings.hidden_hosts);
+            let duration_ms = pending.started.elapsed().as_secs_f64() * 1000.0;
+            let mut captured_response = response_from_parts(&parts, body.clone(), duration_ms);
+            let mut dropped = false;
+
+            if !hidden
+                && let Some(rule) = find_breakpoint(
+                    BreakpointPhase::Response,
+                    &pending.request.method,
+                    &pending.request.host,
+                    path_without_query(&pending.request.path),
+                    Some(captured_response.status),
+                    &settings.breakpoint_rules,
+                )
+                .cloned()
+            {
+                let rule_label = format!("Breakpoint: {}", rule.name);
+                let decision = self
+                    .shared
+                    .pause_at_breakpoint(
+                        rule.name,
+                        BreakpointPhase::Response,
+                        pending.request.clone(),
+                        Some(captured_response.clone()),
+                    )
+                    .await;
+                if let Some(decision) = decision {
+                    match decision.action {
+                        BreakpointAction::Forward => {
+                            let Some(edited_response) = decision.response else {
+                                let message =
+                                    "Response breakpoint did not include a response".to_owned();
+                                let _ = self
+                                    .shared
+                                    .events
+                                    .send(CaptureEvent::Error(message.clone()));
+                                return proxy_error_response(&message);
+                            };
+                            if let Err(error) = apply_edited_response(
+                                &mut parts,
+                                &mut body,
+                                &mut captured_response,
+                                edited_response,
+                            ) {
+                                let message =
+                                    format!("Could not apply breakpoint response: {error}");
+                                let _ = self
+                                    .shared
+                                    .events
+                                    .send(CaptureEvent::Error(message.clone()));
+                                return proxy_error_response(&message);
+                            }
+                            matched_names.push(rule_label);
+                        }
+                        BreakpointAction::Drop => {
+                            body = b"Dropped by HTTP Whisper response breakpoint".to_vec();
+                            parts.status = StatusCode::BAD_GATEWAY;
+                            parts.headers.clear();
+                            parts.headers.insert(
+                                header::CONTENT_TYPE,
+                                "text/plain; charset=utf-8".parse().expect("static header"),
+                            );
+                            captured_response =
+                                response_from_parts(&parts, body.clone(), duration_ms);
+                            matched_names.push(rule_label);
+                            dropped = true;
+                        }
+                    }
+                }
+            }
+
+            if !hidden {
                 let _ = self.shared.body_store.put(&pending.request.body);
                 let _ = self.shared.body_store.put(&body);
                 let exchange = CapturedExchange {
@@ -414,10 +621,14 @@ impl HttpHandler for TrafficHandler {
                     request: pending.request,
                     response: Some(captured_response),
                     rule_matched: (!matched_names.is_empty()).then(|| matched_names.join(", ")),
-                    error: None,
-                    synthetic: pending.synthetic,
+                    error: dropped.then(|| "Dropped at response breakpoint".into()),
+                    synthetic: pending.synthetic || dropped,
                     pinned: false,
-                    notes: String::new(),
+                    notes: if dropped {
+                        "Dropped at response breakpoint".into()
+                    } else {
+                        String::new()
+                    },
                 };
                 let _ = self.shared.events.send(CaptureEvent::Exchange(exchange));
             }
@@ -828,6 +1039,99 @@ fn convert_headers(map: &hudsucker::hyper::HeaderMap) -> Headers {
         .collect()
 }
 
+fn apply_edited_request(
+    parts: &mut hudsucker::hyper::http::request::Parts,
+    body: &mut Vec<u8>,
+    captured: &mut CapturedRequest,
+    mut edited: CapturedRequest,
+) -> Result<()> {
+    let url_changed = edited.scheme != captured.scheme
+        || edited.host != captured.host
+        || edited.port != captured.port
+        || edited.path != captured.path;
+    let headers_changed = edited.headers != captured.headers;
+    let body_changed = edited.body != captured.body;
+    if headers_changed {
+        replace_headers(&mut parts.headers, &edited.headers)?;
+    }
+    if url_changed {
+        let uri: hudsucker::hyper::Uri = edited
+            .url()
+            .parse()
+            .context("edited request URL is invalid")?;
+        let authority = uri
+            .authority()
+            .context("edited request URL has no authority")?
+            .as_str();
+        parts.headers.insert(
+            header::HOST,
+            authority
+                .parse()
+                .context("edited request URL has an invalid authority")?,
+        );
+        parts.uri = uri;
+    }
+    if body_changed {
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts.headers.remove(header::CONTENT_ENCODING);
+        *body = edited.body.clone();
+    }
+    edited.headers = convert_headers(&parts.headers);
+    edited.body = body.clone();
+    *captured = edited;
+    Ok(())
+}
+
+fn apply_edited_response(
+    parts: &mut hudsucker::hyper::http::response::Parts,
+    body: &mut Vec<u8>,
+    captured: &mut CapturedResponse,
+    mut edited: CapturedResponse,
+) -> Result<()> {
+    let status_changed = edited.status != captured.status;
+    let headers_changed = edited.headers != captured.headers;
+    let body_changed = edited.body != captured.body;
+    if status_changed {
+        parts.status = StatusCode::from_u16(edited.status)
+            .context("edited response status is outside 100-599")?;
+    }
+    if headers_changed {
+        replace_headers(&mut parts.headers, &edited.headers)?;
+    }
+    if body_changed {
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts.headers.remove(header::CONTENT_ENCODING);
+        *body = edited.body.clone();
+    }
+    edited.reason = parts.status.canonical_reason().unwrap_or("").into();
+    edited.headers = convert_headers(&parts.headers);
+    edited.body = body.clone();
+    *captured = edited;
+    Ok(())
+}
+
+fn replace_headers(target: &mut hudsucker::hyper::HeaderMap, headers: &Headers) -> Result<()> {
+    target.clear();
+    for item in headers {
+        let name = hudsucker::hyper::header::HeaderName::from_bytes(item.name.trim().as_bytes())
+            .with_context(|| format!("invalid header name: {}", item.name))?;
+        let value = item
+            .value
+            .parse::<hudsucker::hyper::header::HeaderValue>()
+            .with_context(|| format!("invalid value for header {}", item.name))?;
+        target.append(name, value);
+    }
+    Ok(())
+}
+
+fn breakpoint_drop_response(status: StatusCode, body: Vec<u8>) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::from("Dropped by HTTP Whisper breakpoint")))
+}
+
 fn has_supported_content_encoding(headers: &hudsucker::hyper::HeaderMap) -> bool {
     let values = headers.get_all(header::CONTENT_ENCODING);
     let mut found = false;
@@ -1055,6 +1359,61 @@ fn hex_preview(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn start_test_worker(
+        settings: AppSettings,
+    ) -> (CaptureWorker, std::sync::mpsc::Receiver<CaptureEvent>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = CaptureWorker::start(settings, tx).unwrap();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap() {
+                CaptureEvent::Started { .. } => break,
+                CaptureEvent::Error(error) => panic!("proxy failed to start: {error}"),
+                _ => {}
+            }
+        }
+        (worker, rx)
+    }
+
+    fn proxy_client(port: u16, request: String) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        })
+    }
+
+    fn next_paused(rx: &std::sync::mpsc::Receiver<CaptureEvent>) -> PausedBreakpoint {
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
+                CaptureEvent::BreakpointPaused(paused) => break paused,
+                CaptureEvent::Error(error) => panic!("capture failed: {error}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn next_exchange(rx: &std::sync::mpsc::Receiver<CaptureEvent>) -> CapturedExchange {
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
+                CaptureEvent::Exchange(exchange) => break exchange,
+                CaptureEvent::Error(error) => panic!("capture failed: {error}"),
+                _ => {}
+            }
+        }
+    }
 
     #[test]
     fn decodes_utf8_binary() {
@@ -1313,6 +1672,292 @@ mod tests {
         };
         assert_eq!(exchange.rule_matched.as_deref(), Some("Promote user"));
         assert_eq!(exchange.response.unwrap().body, b"admin123".to_vec());
+        worker.join();
+        upstream_thread.join().unwrap();
+    }
+
+    #[test]
+    fn request_breakpoint_forwards_url_body_and_header_edits() {
+        use std::io::{Read, Write};
+
+        let original_upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        original_upstream.set_nonblocking(true).unwrap();
+        let original_upstream_port = original_upstream.local_addr().unwrap().port();
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let upstream_thread = std::thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut buffer = [0_u8; 8192];
+            let size = stream.read(&mut buffer).unwrap();
+            request_tx
+                .send(String::from_utf8_lossy(&buffer[..size]).into_owned())
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let proxy_port = free_port();
+        let settings = AppSettings {
+            capture_port: proxy_port,
+            enable_https_interception: false,
+            auto_configure_system_proxy: false,
+            auto_install_ca: false,
+            breakpoint_rules: vec![crate::config::BreakpointRule {
+                name: "Edit request".into(),
+                enabled: true,
+                phase: BreakpointPhase::Request,
+                method: "POST".into(),
+                host: "127.0.0.1".into(),
+                path: "/original".into(),
+                status: String::new(),
+            }],
+            ..Default::default()
+        };
+        let (mut worker, rx) = start_test_worker(settings);
+        let request = format!(
+            "POST http://127.0.0.1:{original_upstream_port}/original HTTP/1.1\r\nHost: 127.0.0.1:{original_upstream_port}\r\nContent-Length: 8\r\nConnection: close\r\n\r\noriginal"
+        );
+        let client = proxy_client(proxy_port, request);
+        let paused = next_paused(&rx);
+        assert_eq!(paused.phase, BreakpointPhase::Request);
+        let mut edited = paused.request;
+        edited.port = upstream_port;
+        edited.path = "/changed?debug=1".into();
+        edited.body = b"edited-body".to_vec();
+        edited.headers.push(Header {
+            name: "X-Breakpoint".into(),
+            value: "edited".into(),
+        });
+        assert!(worker.resolve_breakpoint(BreakpointDecision {
+            id: paused.id,
+            action: BreakpointAction::Forward,
+            request: edited,
+            response: None,
+        }));
+
+        let response = client.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let upstream_request = request_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(
+            upstream_request.contains("/changed?debug=1"),
+            "{upstream_request}"
+        );
+        assert!(
+            upstream_request
+                .to_ascii_lowercase()
+                .contains("x-breakpoint: edited"),
+            "{upstream_request}"
+        );
+        assert!(
+            upstream_request.contains("edited-body"),
+            "{upstream_request}"
+        );
+        assert_eq!(
+            original_upstream.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let exchange = next_exchange(&rx);
+        assert_eq!(exchange.request.port, upstream_port);
+        assert_eq!(exchange.request.path, "/changed?debug=1");
+        assert_eq!(exchange.request.body, b"edited-body");
+        assert_eq!(
+            exchange.rule_matched.as_deref(),
+            Some("Breakpoint: Edit request")
+        );
+        worker.join();
+        upstream_thread.join().unwrap();
+    }
+
+    #[test]
+    fn response_breakpoint_forwards_status_body_and_header_edits() {
+        use std::io::{Read, Write};
+
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let upstream_thread = std::thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: close\r\n\r\noriginal",
+                )
+                .unwrap();
+        });
+        let proxy_port = free_port();
+        let settings = AppSettings {
+            capture_port: proxy_port,
+            enable_https_interception: false,
+            auto_configure_system_proxy: false,
+            auto_install_ca: false,
+            breakpoint_rules: vec![crate::config::BreakpointRule {
+                name: "Edit response".into(),
+                enabled: true,
+                phase: BreakpointPhase::Response,
+                method: "GET".into(),
+                host: "127.0.0.1".into(),
+                path: "/response".into(),
+                status: "201".into(),
+            }],
+            ..Default::default()
+        };
+        let (mut worker, rx) = start_test_worker(settings);
+        let request = format!(
+            "GET http://127.0.0.1:{upstream_port}/response HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+        );
+        let client = proxy_client(proxy_port, request);
+        let paused = next_paused(&rx);
+        assert_eq!(paused.phase, BreakpointPhase::Response);
+        let mut edited_response = paused.response.unwrap();
+        edited_response.status = 202;
+        edited_response.body = b"edited-response".to_vec();
+        edited_response.headers = vec![
+            Header {
+                name: "Content-Type".into(),
+                value: "text/plain".into(),
+            },
+            Header {
+                name: "X-Breakpoint".into(),
+                value: "edited".into(),
+            },
+        ];
+        assert!(worker.resolve_breakpoint(BreakpointDecision {
+            id: paused.id,
+            action: BreakpointAction::Forward,
+            request: paused.request,
+            response: Some(edited_response),
+        }));
+
+        let response = client.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        assert!(response.contains("edited-response"), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("x-breakpoint: edited"),
+            "{response}"
+        );
+        let exchange = next_exchange(&rx);
+        let captured = exchange.response.unwrap();
+        assert_eq!(captured.status, 202);
+        assert_eq!(captured.body, b"edited-response");
+        assert_eq!(
+            exchange.rule_matched.as_deref(),
+            Some("Breakpoint: Edit response")
+        );
+        worker.join();
+        upstream_thread.join().unwrap();
+    }
+
+    #[test]
+    fn request_breakpoint_drop_blocks_the_upstream_request() {
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let proxy_port = free_port();
+        let settings = AppSettings {
+            capture_port: proxy_port,
+            enable_https_interception: false,
+            auto_configure_system_proxy: false,
+            auto_install_ca: false,
+            breakpoint_rules: vec![crate::config::BreakpointRule {
+                name: "Block request".into(),
+                enabled: true,
+                phase: BreakpointPhase::Request,
+                method: "GET".into(),
+                host: "127.0.0.1".into(),
+                path: "/blocked".into(),
+                status: String::new(),
+            }],
+            ..Default::default()
+        };
+        let (mut worker, rx) = start_test_worker(settings);
+        let request = format!(
+            "GET http://127.0.0.1:{upstream_port}/blocked HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+        );
+        let client = proxy_client(proxy_port, request);
+        let paused = next_paused(&rx);
+        assert!(worker.resolve_breakpoint(BreakpointDecision {
+            id: paused.id,
+            action: BreakpointAction::Drop,
+            request: paused.request,
+            response: None,
+        }));
+        let response = client.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(response.contains("Dropped by HTTP Whisper"), "{response}");
+        let exchange = next_exchange(&rx);
+        assert!(exchange.synthetic);
+        assert_eq!(
+            exchange.error.as_deref(),
+            Some("Dropped at request breakpoint")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            upstream.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        worker.join();
+    }
+
+    #[test]
+    fn response_breakpoint_drop_returns_a_blocked_response() {
+        use std::io::{Read, Write};
+
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let upstream_thread = std::thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let proxy_port = free_port();
+        let settings = AppSettings {
+            capture_port: proxy_port,
+            enable_https_interception: false,
+            auto_configure_system_proxy: false,
+            auto_install_ca: false,
+            breakpoint_rules: vec![crate::config::BreakpointRule {
+                name: "Block response".into(),
+                enabled: true,
+                phase: BreakpointPhase::Response,
+                method: "GET".into(),
+                host: "127.0.0.1".into(),
+                path: "/blocked-response".into(),
+                status: "2*".into(),
+            }],
+            ..Default::default()
+        };
+        let (mut worker, rx) = start_test_worker(settings);
+        let request = format!(
+            "GET http://127.0.0.1:{upstream_port}/blocked-response HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+        );
+        let client = proxy_client(proxy_port, request);
+        let paused = next_paused(&rx);
+        assert!(worker.resolve_breakpoint(BreakpointDecision {
+            id: paused.id,
+            action: BreakpointAction::Drop,
+            request: paused.request,
+            response: paused.response,
+        }));
+        let response = client.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(response.contains("Dropped by HTTP Whisper"), "{response}");
+        let exchange = next_exchange(&rx);
+        assert_eq!(exchange.response.unwrap().status, 502);
+        assert_eq!(
+            exchange.error.as_deref(),
+            Some("Dropped at response breakpoint")
+        );
         worker.join();
         upstream_thread.join().unwrap();
     }
