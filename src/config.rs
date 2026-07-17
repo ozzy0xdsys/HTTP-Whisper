@@ -109,6 +109,7 @@ pub struct AppSettings {
     pub auto_install_ca: bool,
     pub start_with_windows: bool,
     pub auto_connect: bool,
+    pub interface_style: String,
     pub theme: String,
     pub autosave_interval_seconds: u64,
     pub body_memory_limit_bytes: usize,
@@ -128,6 +129,7 @@ impl Default for AppSettings {
             auto_install_ca: true,
             start_with_windows: false,
             auto_connect: false,
+            interface_style: "refined".to_owned(),
             theme: "system".to_owned(),
             autosave_interval_seconds: 30,
             body_memory_limit_bytes: 1_048_576,
@@ -177,6 +179,10 @@ impl AppSettings {
         anyhow::ensure!(
             matches!(self.theme.as_str(), "system" | "dark" | "light"),
             "theme must be system, dark, or light"
+        );
+        anyhow::ensure!(
+            matches!(self.interface_style.as_str(), "refined" | "classic"),
+            "interface style must be refined or classic"
         );
         anyhow::ensure!(
             self.autosave_interval_seconds >= 5,
@@ -282,6 +288,16 @@ mod tests {
         let settings: AppSettings = serde_json::from_str("{}").unwrap();
         assert!(!settings.start_with_windows);
         assert!(!settings.auto_connect);
+        assert_eq!(settings.interface_style, "refined");
+    }
+
+    #[test]
+    fn rejects_unknown_interface_styles() {
+        let settings = AppSettings {
+            interface_style: "unknown".into(),
+            ..Default::default()
+        };
+        assert!(settings.validate().is_err());
     }
 
     #[test]

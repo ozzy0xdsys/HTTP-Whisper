@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0 - 2026-07-17
+
+- Add a refined Windows XP-inspired interface with Segoe UI, cleaner spacing, modernized surfaces, and stronger action hierarchy.
+- Add a persistent Interface style selector with Refined XP and Classic XP modes.
+- Keep the previous classic interface available as an immediate in-app fallback.
+
 ## 0.4.1 - 2026-07-16
 
 - Keep the Disallowed domains editor as a persistent multiline draft while Settings is open.

@@ -2,8 +2,8 @@ use std::{fs, sync::mpsc, thread, time::Duration};
 
 use chrono::{TimeDelta, Utc};
 use eframe::egui::{
-    self, Align, Color32, FontData, FontDefinitions, FontFamily, FontId, Frame, Layout, Margin,
-    Rect, RichText, ScrollArea, Stroke, TextEdit, Ui, UiBuilder, Vec2,
+    self, Align, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame,
+    Layout, Margin, Rect, RichText, ScrollArea, Stroke, TextEdit, Ui, UiBuilder, Vec2,
 };
 use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
@@ -21,13 +21,49 @@ use crate::{
     windows_proxy::{configure_startup, install_firefox_support},
 };
 
-const XP_BG: Color32 = Color32::from_rgb(236, 233, 216);
-const XP_TOOLBAR: Color32 = Color32::from_rgb(214, 223, 247);
-const XP_BUTTON: Color32 = Color32::from_rgb(236, 233, 216);
-const XP_BORDER: Color32 = Color32::from_rgb(127, 157, 185);
-const XP_BLUE: Color32 = Color32::from_rgb(49, 106, 197);
-const XP_WHITE: Color32 = Color32::WHITE;
-const XP_TEXT: Color32 = Color32::from_rgb(0, 0, 0);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UiPalette {
+    background: Color32,
+    panel: Color32,
+    toolbar: Color32,
+    surface: Color32,
+    button: Color32,
+    border: Color32,
+    accent: Color32,
+    text: Color32,
+    hover: Color32,
+    active: Color32,
+}
+
+fn ui_palette(style: &str) -> UiPalette {
+    if style == "classic" {
+        UiPalette {
+            background: Color32::from_rgb(236, 233, 216),
+            panel: Color32::from_rgb(236, 233, 216),
+            toolbar: Color32::from_rgb(214, 223, 247),
+            surface: Color32::WHITE,
+            button: Color32::from_rgb(236, 233, 216),
+            border: Color32::from_rgb(127, 157, 185),
+            accent: Color32::from_rgb(49, 106, 197),
+            text: Color32::BLACK,
+            hover: Color32::from_rgb(225, 233, 250),
+            active: Color32::from_rgb(196, 210, 238),
+        }
+    } else {
+        UiPalette {
+            background: Color32::from_rgb(228, 233, 241),
+            panel: Color32::from_rgb(243, 246, 250),
+            toolbar: Color32::from_rgb(235, 240, 247),
+            surface: Color32::from_rgb(255, 255, 255),
+            button: Color32::from_rgb(246, 248, 251),
+            border: Color32::from_rgb(143, 156, 175),
+            accent: Color32::from_rgb(35, 91, 174),
+            text: Color32::from_rgb(29, 36, 48),
+            hover: Color32::from_rgb(224, 234, 248),
+            active: Color32::from_rgb(63, 112, 184),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DialogKind {
@@ -51,6 +87,7 @@ pub struct HttpWhisperApp {
     repository: Option<SessionRepository>,
     worker: Option<CaptureWorker>,
     auto_connect_pending: bool,
+    applied_interface_style: String,
     sessions: Vec<Session>,
     selected: Option<Uuid>,
     filter: String,
@@ -65,8 +102,9 @@ pub struct HttpWhisperApp {
 
 impl HttpWhisperApp {
     pub fn new(cc: &eframe::CreationContext<'_>, settings: AppSettings) -> Self {
-        configure_theme(&cc.egui_ctx);
+        configure_theme(&cc.egui_ctx, &settings.interface_style);
         let auto_connect_pending = settings.auto_connect;
+        let applied_interface_style = settings.interface_style.clone();
         let startup_error = configure_startup(settings.start_with_windows).err();
         let hidden_hosts_draft = settings.hidden_hosts.join("\n");
         let (events_tx, events_rx) = mpsc::channel();
@@ -87,6 +125,7 @@ impl HttpWhisperApp {
             repository,
             worker: None,
             auto_connect_pending,
+            applied_interface_style,
             sessions: sample_sessions(),
             selected: None,
             filter: String::new(),
@@ -377,8 +416,9 @@ impl HttpWhisperApp {
     }
 
     fn top_menu(&mut self, ui: &mut Ui) {
+        let palette = ui_palette(&self.settings.interface_style);
         Frame::new()
-            .fill(XP_BG)
+            .fill(palette.panel)
             .inner_margin(Margin::symmetric(4, 1))
             .show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
@@ -417,33 +457,55 @@ impl HttpWhisperApp {
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
+        let palette = ui_palette(&self.settings.interface_style);
+        let refined = self.settings.interface_style == "refined";
         Frame::new()
-            .fill(XP_TOOLBAR)
+            .fill(palette.toolbar)
             .inner_margin(Margin::symmetric(6, 5))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(164, 180, 220)))
+            .stroke(Stroke::new(1.0, palette.border))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 5.0;
+                    if refined {
+                        ui.add_sized(
+                            [112.0, 25.0],
+                            egui::Label::new(
+                                RichText::new("HTTP Whisper")
+                                    .strong()
+                                    .size(15.0)
+                                    .color(palette.accent),
+                            ),
+                        );
+                        ui.separator();
+                    }
                     let running = self.worker.as_ref().is_some_and(CaptureWorker::is_running);
-                    if ui
-                        .add_enabled(!running, toolbar_button("Start Capture"))
-                        .clicked()
-                    {
+                    let start_button = if refined {
+                        primary_toolbar_button("Start Capture", palette)
+                    } else {
+                        toolbar_button("Start Capture", palette)
+                    };
+                    if ui.add_enabled(!running, start_button).clicked() {
                         self.start_capture();
                     }
-                    if ui.add_enabled(running, toolbar_button("Stop")).clicked() {
+                    if ui
+                        .add_enabled(running, toolbar_button("Stop", palette))
+                        .clicked()
+                    {
                         self.stop_capture();
                     }
-                    if ui.add(toolbar_button("Replay")).clicked() {
+                    if ui.add(toolbar_button("Replay", palette)).clicked() {
                         self.replay_selected();
                     }
-                    if ui.add(toolbar_button("Auto Responses")).clicked() {
+                    if ui.add(toolbar_button("Auto Responses", palette)).clicked() {
                         self.open_dialog(DialogKind::AutoResponses);
                     }
-                    if ui.add(toolbar_button("Response Rewrites")).clicked() {
+                    if ui
+                        .add(toolbar_button("Response Rewrites", palette))
+                        .clicked()
+                    {
                         self.open_dialog(DialogKind::ResponseRewrites);
                     }
-                    if ui.add(toolbar_button("Certificates")).clicked() {
+                    if ui.add(toolbar_button("Certificates", palette)).clicked() {
                         self.open_dialog(DialogKind::Certificates);
                     }
                 });
@@ -494,8 +556,8 @@ impl HttpWhisperApp {
         let mut copy = None;
         let mut replay = None;
         Frame::new()
-            .fill(XP_WHITE)
-            .stroke(Stroke::new(1.0, XP_BORDER))
+            .fill(ui.visuals().extreme_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
             .show(ui, |ui| {
                 ui.set_height(height);
                 ScrollArea::horizontal()
@@ -610,8 +672,8 @@ impl HttpWhisperApp {
     fn inspector(&mut self, ui: &mut Ui) {
         let tabs = ["Overview", "Request", "Response", "Headers", "Raw", "Notes"];
         Frame::new()
-            .fill(XP_BG)
-            .stroke(Stroke::new(1.0, XP_BORDER))
+            .fill(ui.visuals().panel_fill)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (index, label) in tabs.iter().enumerate() {
@@ -647,8 +709,8 @@ impl HttpWhisperApp {
 
     fn status_bar(&self, ui: &mut Ui) {
         Frame::new()
-            .fill(XP_BG)
-            .stroke(Stroke::new(1.0, Color32::from_rgb(128, 128, 128)))
+            .fill(ui.visuals().panel_fill)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
             .inner_margin(Margin::symmetric(5, 3))
             .show(ui, |ui| {
                 ui.add(egui::Label::new(&self.status).truncate());
@@ -670,7 +732,7 @@ impl HttpWhisperApp {
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
-            .fixed_size([470.0, 360.0])
+            .fixed_size([500.0, 395.0])
             .show(ui.ctx(), |ui| {
                 egui::Grid::new("settings-grid")
                     .num_columns(2)
@@ -711,6 +773,20 @@ impl HttpWhisperApp {
                         ui.end_row();
                         ui.label("On launch");
                         ui.checkbox(&mut self.settings_draft.auto_connect, "Auto-connect");
+                        ui.end_row();
+                        ui.label("Interface style");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.settings_draft.interface_style,
+                                "refined".into(),
+                                "Refined XP",
+                            );
+                            ui.selectable_value(
+                                &mut self.settings_draft.interface_style,
+                                "classic".into(),
+                                "Classic XP",
+                            );
+                        });
                         ui.end_row();
                     });
                 ui.separator();
@@ -948,10 +1024,10 @@ impl HttpWhisperApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     ui.heading("HTTP Whisper");
-                    ui.label("Version 0.4.1");
+                    ui.label("Version 0.5.0");
                     ui.add_space(8.0);
                     ui.label("Native Rust HTTP/HTTPS and WebSocket debugging workbench");
-                    ui.label("Classic Windows XP interface");
+                    ui.label("Refined and Classic Windows XP interface styles");
                     ui.add_space(12.0);
                     if ui.button("OK").clicked() {
                         self.dialog = None;
@@ -963,6 +1039,10 @@ impl HttpWhisperApp {
 
 impl eframe::App for HttpWhisperApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.applied_interface_style != self.settings.interface_style {
+            configure_theme(ctx, &self.settings.interface_style);
+            self.applied_interface_style = self.settings.interface_style.clone();
+        }
         if std::mem::take(&mut self.auto_connect_pending) {
             self.start_capture();
         }
@@ -975,7 +1055,7 @@ impl eframe::App for HttpWhisperApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let viewport_rect = ui.max_rect();
         Frame::new()
-            .fill(XP_BG)
+            .fill(ui.visuals().panel_fill)
             .inner_margin(Margin::ZERO)
             .show(ui, |ui| {
                 self.top_menu(ui);
@@ -1032,21 +1112,30 @@ impl eframe::App for HttpWhisperApp {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        XP_BG.to_normalized_gamma_f32()
+        ui_palette(&self.settings.interface_style)
+            .background
+            .to_normalized_gamma_f32()
     }
 }
 
-fn configure_theme(ctx: &egui::Context) {
+fn configure_theme(ctx: &egui::Context, interface_style: &str) {
+    let refined = interface_style == "refined";
+    let palette = ui_palette(interface_style);
     let mut fonts = FontDefinitions::default();
-    if let Ok(bytes) = fs::read(r"C:\Windows\Fonts\tahoma.ttf") {
+    let (interface_font, interface_font_path) = if refined {
+        ("Segoe UI", r"C:\Windows\Fonts\segoeui.ttf")
+    } else {
+        ("Tahoma", r"C:\Windows\Fonts\tahoma.ttf")
+    };
+    if let Ok(bytes) = fs::read(interface_font_path) {
         fonts
             .font_data
-            .insert("Tahoma".into(), FontData::from_owned(bytes).into());
+            .insert(interface_font.into(), FontData::from_owned(bytes).into());
         fonts
             .families
             .entry(FontFamily::Proportional)
             .or_default()
-            .insert(0, "Tahoma".into());
+            .insert(0, interface_font.into());
     }
     if let Ok(bytes) = fs::read(r"C:\Windows\Fonts\consola.ttf") {
         fonts
@@ -1060,48 +1149,102 @@ fn configure_theme(ctx: &egui::Context) {
     }
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
-    style.spacing.item_spacing = Vec2::new(6.0, 4.0);
-    style.spacing.button_padding = Vec2::new(8.0, 4.0);
+    style.spacing.item_spacing = if refined {
+        Vec2::new(8.0, 5.0)
+    } else {
+        Vec2::new(6.0, 4.0)
+    };
+    style.spacing.button_padding = if refined {
+        Vec2::new(10.0, 5.0)
+    } else {
+        Vec2::new(8.0, 4.0)
+    };
     style.visuals = egui::Visuals::light();
-    style.visuals.panel_fill = XP_BG;
-    style.visuals.window_fill = XP_BG;
-    style.visuals.extreme_bg_color = XP_WHITE;
-    style.visuals.selection.bg_fill = XP_BLUE;
-    style.visuals.selection.stroke = Stroke::new(1.0, XP_WHITE);
-    style.visuals.widgets.inactive.bg_fill = XP_BUTTON;
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, XP_TEXT);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(225, 233, 250);
-    style.visuals.widgets.active.bg_fill = Color32::from_rgb(196, 210, 238);
-    style.visuals.widgets.noninteractive.bg_fill = XP_BG;
+    style.visuals.override_text_color = Some(palette.text);
+    style.visuals.panel_fill = palette.background;
+    style.visuals.window_fill = palette.panel;
+    style.visuals.extreme_bg_color = palette.surface;
+    style.visuals.faint_bg_color = palette.toolbar;
+    style.visuals.code_bg_color = palette.surface;
+    style.visuals.hyperlink_color = palette.accent;
+    style.visuals.selection.bg_fill = palette.accent;
+    style.visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    style.visuals.window_stroke = Stroke::new(1.0, palette.border);
+    style.visuals.window_corner_radius = CornerRadius::same(if refined { 5 } else { 1 });
+    style.visuals.menu_corner_radius = CornerRadius::same(if refined { 4 } else { 1 });
+    style.visuals.widgets.inactive.bg_fill = palette.button;
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, palette.border);
+    style.visuals.widgets.hovered.bg_fill = palette.hover;
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette.accent);
+    style.visuals.widgets.active.bg_fill = palette.active;
+    style.visuals.widgets.active.fg_stroke = Stroke::new(
+        1.0,
+        if refined {
+            Color32::WHITE
+        } else {
+            palette.text
+        },
+    );
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, palette.accent);
+    style.visuals.widgets.open.bg_fill = palette.hover;
+    style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.widgets.open.bg_stroke = Stroke::new(1.0, palette.accent);
+    style.visuals.widgets.noninteractive.bg_fill = palette.panel;
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.border);
+    let widget_radius = CornerRadius::same(if refined { 4 } else { 1 });
+    style.visuals.widgets.inactive.corner_radius = widget_radius;
+    style.visuals.widgets.hovered.corner_radius = widget_radius;
+    style.visuals.widgets.active.corner_radius = widget_radius;
+    style.visuals.widgets.open.corner_radius = widget_radius;
+    style.visuals.widgets.noninteractive.corner_radius = widget_radius;
+    let body_size = if refined { 13.0 } else { 12.0 };
     style.text_styles.insert(
         egui::TextStyle::Body,
-        FontId::new(12.0, FontFamily::Proportional),
+        FontId::new(body_size, FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Button,
-        FontId::new(12.0, FontFamily::Proportional),
+        FontId::new(if refined { 12.5 } else { 12.0 }, FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Small,
-        FontId::new(11.0, FontFamily::Proportional),
+        FontId::new(if refined { 11.5 } else { 11.0 }, FontFamily::Proportional),
     );
     ctx.set_style_of(egui::Theme::Light, style);
     ctx.set_theme(egui::ThemePreference::Light);
 }
 
-fn toolbar_button(text: &'static str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).strong()).min_size(Vec2::new(88.0, 25.0))
+fn toolbar_button(text: &'static str, palette: UiPalette) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).strong().color(palette.text))
+        .min_size(Vec2::new(88.0, 25.0))
+}
+
+fn primary_toolbar_button(text: &'static str, palette: UiPalette) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
+        .fill(palette.accent)
+        .stroke(Stroke::new(1.0, palette.accent))
+        .min_size(Vec2::new(96.0, 25.0))
 }
 
 fn metric(ui: &mut Ui, label: &str, value: &str, width: f32) {
     group_box(ui, label, Vec2::new(width, 49.0), |ui| {
         Frame::new()
-            .fill(XP_WHITE)
+            .fill(ui.visuals().extreme_bg_color)
             .inner_margin(Margin::symmetric(5, 4))
             .show(ui, |ui| {
                 ui.set_width(width - 18.0);
                 ui.vertical_centered(|ui| {
-                    ui.add(egui::Label::new(RichText::new(value).strong()).truncate());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(value)
+                                .strong()
+                                .color(ui.visuals().text_color()),
+                        )
+                        .truncate(),
+                    );
                 });
             });
     });
@@ -1111,12 +1254,17 @@ fn group_box<R>(ui: &mut Ui, title: &str, size: Vec2, add: impl FnOnce(&mut Ui) 
     ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
         ui.set_min_size(size);
         Frame::new()
-            .fill(XP_BG)
-            .stroke(Stroke::new(1.0, Color32::from_rgb(160, 160, 160)))
+            .fill(ui.visuals().panel_fill)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
             .inner_margin(Margin::symmetric(7, 6))
             .show(ui, |ui| {
                 ui.set_min_size(size - Vec2::new(14.0, 12.0));
-                ui.label(RichText::new(title).strong().small());
+                ui.label(
+                    RichText::new(title)
+                        .strong()
+                        .small()
+                        .color(ui.visuals().text_color()),
+                );
                 add(ui)
             })
             .inner
@@ -1134,13 +1282,18 @@ fn fixed_group_box<R>(ui: &mut Ui, title: &str, size: Vec2, add: impl FnOnce(&mu
             ui.set_clip_rect(rect);
             ui.set_max_size(size);
             Frame::new()
-                .fill(XP_BG)
-                .stroke(Stroke::new(1.0, Color32::from_rgb(160, 160, 160)))
+                .fill(ui.visuals().panel_fill)
+                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
                 .inner_margin(Margin::symmetric(7, 6))
                 .show(ui, |ui| {
                     ui.set_width((size.x - 14.0).max(1.0));
                     ui.set_max_height((size.y - 12.0).max(1.0));
-                    ui.label(RichText::new(title).strong().small());
+                    ui.label(
+                        RichText::new(title)
+                            .strong()
+                            .small()
+                            .color(ui.visuals().text_color()),
+                    );
                     add(ui)
                 })
                 .inner
@@ -1478,6 +1631,15 @@ mod tests {
             parse_hidden_hosts(draft),
             vec!["one.example.com", "two.example.com"]
         );
+    }
+
+    #[test]
+    fn refined_and_classic_palettes_are_distinct_and_reversible() {
+        let refined = ui_palette("refined");
+        let classic = ui_palette("classic");
+        assert_ne!(refined, classic);
+        assert_eq!(ui_palette("classic"), classic);
+        assert_eq!(ui_palette("refined"), refined);
     }
 
     #[test]
