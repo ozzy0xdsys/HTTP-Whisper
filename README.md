@@ -1,6 +1,6 @@
 # HTTP Whisper
 
-HTTP Whisper is a native Windows HTTP, HTTPS, and WebSocket debugging proxy written in Rust. It uses a refined Windows XP-inspired desktop interface and automatically prepares Windows and Firefox for local interception while capture is active.
+HTTP Whisper is a native Windows HTTP, HTTPS, and WebSocket debugging proxy written in Rust. It uses a classic Windows XP-style desktop interface and automatically prepares Windows and Firefox for local interception while capture is active.
 
 ## Features
 
@@ -10,7 +10,6 @@ HTTP Whisper is a native Windows HTTP, HTTPS, and WebSocket debugging proxy writ
 - Automatic local CA generation and current-user Root store installation
 - Automatic Firefox system-proxy policy and enterprise-root trust
 - Optional current-user Windows startup registration and launch-time auto-connect
-- Reversible Refined XP and Classic XP interface styles
 - Local `mitm.it` certificate install page while capture is running
 - Live HTTP requests and responses with raw Authorization headers visible in the inspector
 - Live incoming and outgoing WebSocket messages
@@ -68,8 +67,6 @@ With capture running, `http://mitm.it/` is handled locally by HTTP Whisper and s
 Open **File > Settings** to enable **Start HTTP Whisper** and **Auto-connect** independently. Start HTTP Whisper adds the current executable to the current user's Windows startup registry entry without requiring administrator rights. Auto-connect starts capture immediately whenever the app launches, using the configured host, port, certificate, Firefox, and Windows proxy settings.
 
 Enable both options to launch HTTP Whisper at Windows sign-in and begin capturing automatically. Moving the executable is supported: the startup path is refreshed whenever HTTP Whisper runs or Settings are saved.
-
-The **Interface style** control switches between the upgraded Refined XP design and the original Classic XP design. The choice is stored in settings, so the UI experiment can be kept or reverted without reinstalling or rolling back code.
 
 ## Automatic Responses
 

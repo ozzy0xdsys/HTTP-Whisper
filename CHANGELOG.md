@@ -1,10 +1,14 @@
 # Changelog
 
+## 0.5.1 - 2026-07-17
+
+- Remove the Refined XP interface and its style selector.
+- Restore the compact Tahoma-based Classic XP interface as the only UI.
+- Preserve all capture, rewrite, WebSocket, certificate, Firefox, and startup features.
+
 ## 0.5.0 - 2026-07-17
 
-- Add a refined Windows XP-inspired interface with Segoe UI, cleaner spacing, modernized surfaces, and stronger action hierarchy.
-- Add a persistent Interface style selector with Refined XP and Classic XP modes.
-- Keep the previous classic interface available as an immediate in-app fallback.
+- Added an experimental Refined XP interface with an in-app Classic XP fallback.
 
 ## 0.4.1 - 2026-07-16
 
