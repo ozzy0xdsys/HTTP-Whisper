@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     capture::CaptureWorker,
-    config::{AppPaths, AppSettings, AutoResponseRule, ResponseRewriteRule},
+    config::{AppPaths, AppSettings, AutoResponseRule, ResponseRewriteRule, RowHighlightPreset},
     filtering::matches_filter,
     model::{
         CaptureEvent, CapturedExchange, CapturedRequest, CapturedResponse, Header, Session,
@@ -64,6 +64,7 @@ pub struct HttpWhisperApp {
     selected: Option<Uuid>,
     filter: String,
     tab: usize,
+    settings_tab: usize,
     dialog: Option<DialogKind>,
     state: String,
     ca_state: String,
@@ -101,6 +102,7 @@ impl HttpWhisperApp {
             selected: None,
             filter: String::new(),
             tab: 0,
+            settings_tab: 0,
             dialog: None,
             state: "Idle".into(),
             ca_state: if cfg!(windows) {
@@ -609,12 +611,17 @@ impl HttpWhisperApp {
                                 body.rows(21.0, rows.len(), |mut row| {
                                     let session = &rows[row.index()];
                                     let id = session.id();
-                                    row.set_selected(self.selected == Some(id));
+                                    let is_selected = self.selected == Some(id);
+                                    let highlight =
+                                        row_highlight_color(&self.settings, session, is_selected);
+                                    row.set_selected(is_selected);
                                     row.col(|ui| {
+                                        paint_row_cell(ui, highlight);
                                         threat_indicator(ui, session.threat());
                                     });
                                     for value in row_values(session) {
                                         row.col(|ui| {
+                                            paint_row_cell(ui, highlight);
                                             ui.add(egui::Label::new(value).truncate());
                                         });
                                     }
@@ -740,77 +747,23 @@ impl HttpWhisperApp {
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
-            .fixed_size([470.0, 400.0])
+            .fixed_size([460.0, 280.0])
             .show(ui.ctx(), |ui| {
-                egui::Grid::new("settings-grid")
-                    .num_columns(2)
-                    .spacing([12.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("Capture host");
-                        ui.text_edit_singleline(&mut self.settings_draft.capture_host);
-                        ui.end_row();
-                        ui.label("Capture port");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings_draft.capture_port)
-                                .range(1..=65535),
-                        );
-                        ui.end_row();
-                        ui.label("HTTPS interception");
-                        ui.checkbox(
-                            &mut self.settings_draft.enable_https_interception,
-                            "Enabled",
-                        );
-                        ui.end_row();
-                        #[cfg(windows)]
-                        {
-                            ui.label("Windows proxy");
-                            ui.checkbox(
-                                &mut self.settings_draft.auto_configure_system_proxy,
-                                "Configure automatically",
-                            );
-                            ui.end_row();
-                            ui.label("Local CA");
-                            ui.checkbox(
-                                &mut self.settings_draft.auto_install_ca,
-                                "Install automatically",
-                            );
-                            ui.end_row();
-                            ui.label("Windows startup");
-                            ui.checkbox(
-                                &mut self.settings_draft.start_with_windows,
-                                "Start HTTP Whisper",
-                            );
-                            ui.end_row();
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            ui.label("System proxy");
-                            ui.label("Configure manually");
-                            ui.end_row();
-                            ui.label("Local CA");
-                            ui.label("Install from http://mitm.it/");
-                            ui.end_row();
-                        }
-                        ui.label("On launch");
-                        ui.checkbox(&mut self.settings_draft.auto_connect, "Auto-connect");
-                        ui.end_row();
-                        ui.label("Traffic warnings");
-                        ui.checkbox(
-                            &mut self.settings_draft.threat_detection_enabled,
-                            "Detect suspicious activity",
-                        );
-                        ui.end_row();
-                        ui.label("Idle threshold");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings_draft.idle_warning_minutes)
-                                .range(1..=120)
-                                .suffix(" min"),
-                        );
-                        ui.end_row();
-                    });
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.settings_tab, 0, "General");
+                    ui.selectable_value(&mut self.settings_tab, 1, "Warnings");
+                });
                 ui.separator();
-                ui.label("Disallowed domains (one per line)");
-                scrollable_text_editor(ui, "hidden-hosts", &mut self.hidden_hosts_draft, 70.0);
+                ScrollArea::vertical()
+                    .id_salt("settings-page")
+                    .auto_shrink([false, false])
+                    .max_height(180.0)
+                    .show(ui, |ui| match self.settings_tab {
+                        0 => self.settings_general_tab(ui),
+                        _ => self.settings_warnings_tab(ui),
+                    });
+                ui.add_space(4.0);
+                ui.separator();
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Close").clicked() {
                         self.dialog = None;
@@ -820,6 +773,137 @@ impl HttpWhisperApp {
                     }
                 });
             });
+    }
+
+    fn settings_general_tab(&mut self, ui: &mut Ui) {
+        egui::Grid::new("settings-general-grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Capture host");
+                ui.text_edit_singleline(&mut self.settings_draft.capture_host);
+                ui.end_row();
+                ui.label("Capture port");
+                ui.add(
+                    egui::DragValue::new(&mut self.settings_draft.capture_port).range(1..=65535),
+                );
+                ui.end_row();
+                ui.label("HTTPS interception");
+                ui.checkbox(
+                    &mut self.settings_draft.enable_https_interception,
+                    "Enabled",
+                );
+                ui.end_row();
+                #[cfg(windows)]
+                {
+                    ui.label("Windows proxy");
+                    ui.checkbox(
+                        &mut self.settings_draft.auto_configure_system_proxy,
+                        "Configure automatically",
+                    );
+                    ui.end_row();
+                    ui.label("Local CA");
+                    ui.checkbox(
+                        &mut self.settings_draft.auto_install_ca,
+                        "Install automatically",
+                    );
+                    ui.end_row();
+                    ui.label("Windows startup");
+                    ui.checkbox(
+                        &mut self.settings_draft.start_with_windows,
+                        "Start HTTP Whisper",
+                    );
+                    ui.end_row();
+                }
+                #[cfg(not(windows))]
+                {
+                    ui.label("System proxy");
+                    ui.label("Configure manually");
+                    ui.end_row();
+                    ui.label("Local CA");
+                    ui.label("Install from http://mitm.it/");
+                    ui.end_row();
+                }
+                ui.label("On launch");
+                ui.checkbox(&mut self.settings_draft.auto_connect, "Auto-connect");
+                ui.end_row();
+            });
+        ui.separator();
+        ui.label("Disallowed domains (one per line)");
+        scrollable_text_editor(ui, "hidden-hosts", &mut self.hidden_hosts_draft, 70.0);
+    }
+
+    fn settings_warnings_tab(&mut self, ui: &mut Ui) {
+        egui::Grid::new("settings-warnings-grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Traffic warnings");
+                ui.checkbox(
+                    &mut self.settings_draft.threat_detection_enabled,
+                    "Detect suspicious activity",
+                );
+                ui.end_row();
+                ui.label("Idle threshold");
+                ui.add(
+                    egui::DragValue::new(&mut self.settings_draft.idle_warning_minutes)
+                        .range(1..=120)
+                        .suffix(" min"),
+                );
+                ui.end_row();
+                ui.label("Row highlighting");
+                ui.checkbox(
+                    &mut self.settings_draft.row_highlighting_enabled,
+                    "Highlight suspicious rows",
+                );
+                ui.end_row();
+                ui.label("Highlight preset");
+                let mut preset = self.settings_draft.row_highlight_preset;
+                ui.add_enabled_ui(self.settings_draft.row_highlighting_enabled, |ui| {
+                    egui::ComboBox::from_id_salt("row-highlight-preset")
+                        .selected_text(preset.label())
+                        .show_ui(ui, |ui| {
+                            for option in RowHighlightPreset::ALL {
+                                ui.selectable_value(&mut preset, option, option.label());
+                            }
+                        });
+                });
+                if preset != self.settings_draft.row_highlight_preset {
+                    self.settings_draft.apply_row_highlight_preset(preset);
+                }
+                ui.end_row();
+                ui.label("Suspicious color");
+                let suspicious_changed = ui
+                    .add_enabled_ui(self.settings_draft.row_highlighting_enabled, |ui| {
+                        ui.color_edit_button_srgb(&mut self.settings_draft.suspicious_row_color)
+                    })
+                    .inner
+                    .changed();
+                ui.end_row();
+                ui.label("High-risk color");
+                let high_changed = ui
+                    .add_enabled_ui(self.settings_draft.row_highlighting_enabled, |ui| {
+                        ui.color_edit_button_srgb(&mut self.settings_draft.high_risk_row_color)
+                    })
+                    .inner
+                    .changed();
+                if suspicious_changed || high_changed {
+                    self.settings_draft.row_highlight_preset = RowHighlightPreset::Custom;
+                }
+                ui.end_row();
+            });
+        ui.separator();
+        ui.label("Preview");
+        highlight_preview(
+            ui,
+            "Suspicious traffic",
+            self.settings_draft.suspicious_row_color,
+        );
+        highlight_preview(
+            ui,
+            "High-risk traffic",
+            self.settings_draft.high_risk_row_color,
+        );
     }
 
     fn auto_responses_dialog(&mut self, ui: &mut Ui) {
@@ -1046,7 +1130,7 @@ impl HttpWhisperApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     ui.heading("HTTP Whisper");
-                    ui.label("Version 0.7.0");
+                    ui.label("Version 0.7.1");
                     ui.add_space(8.0);
                     ui.label("Native Rust HTTP/HTTPS and WebSocket debugging workbench");
                     ui.label("Classic Windows XP interface");
@@ -1346,6 +1430,53 @@ fn threat_indicator(ui: &mut Ui, threat: &ThreatAssessment) {
         XP_TEXT,
     );
     response.on_hover_text(threat.tooltip());
+}
+
+fn row_highlight_color(
+    settings: &AppSettings,
+    session: &Session,
+    is_selected: bool,
+) -> Option<Color32> {
+    if !settings.row_highlighting_enabled || is_selected {
+        return None;
+    }
+    let color = match session.threat().level {
+        ThreatLevel::Suspicious => settings.suspicious_row_color,
+        ThreatLevel::High => settings.high_risk_row_color,
+        ThreatLevel::None | ThreatLevel::Notice => return None,
+    };
+    Some(Color32::from_rgb(color[0], color[1], color[2]))
+}
+
+fn paint_row_cell(ui: &mut Ui, color: Option<Color32>) {
+    let Some(color) = color else { return };
+    let rect = ui
+        .max_rect()
+        .expand2(ui.spacing().item_spacing * 0.5)
+        .intersect(ui.clip_rect());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::ZERO, color);
+}
+
+fn highlight_preview(ui: &mut Ui, label: &str, color: [u8; 3]) {
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), egui::Sense::hover());
+    let fill = Color32::from_rgb(color[0], color[1], color[2]);
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::ZERO, fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::ZERO,
+        Stroke::new(1.0, XP_BORDER),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.left_center() + egui::vec2(6.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.0),
+        XP_TEXT,
+    );
 }
 
 fn row_values(session: &Session) -> Vec<String> {
@@ -1704,5 +1835,31 @@ mod tests {
         for size in &sizes[3..] {
             assert_eq!(*size, stable_size);
         }
+    }
+
+    #[test]
+    fn row_highlight_respects_risk_selection_and_settings() {
+        let mut settings = AppSettings::default();
+        let mut session = sample_sessions().remove(0);
+        if let Session::Http(exchange) = &mut session {
+            exchange.threat.level = ThreatLevel::Suspicious;
+        }
+
+        assert_eq!(
+            row_highlight_color(&settings, &session, false),
+            Some(Color32::from_rgb(255, 244, 190))
+        );
+        assert_eq!(row_highlight_color(&settings, &session, true), None);
+
+        if let Session::Http(exchange) = &mut session {
+            exchange.threat.level = ThreatLevel::High;
+        }
+        assert_eq!(
+            row_highlight_color(&settings, &session, false),
+            Some(Color32::from_rgb(255, 210, 204))
+        );
+
+        settings.row_highlighting_enabled = false;
+        assert_eq!(row_highlight_color(&settings, &session, false), None);
     }
 }

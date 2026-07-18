@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1 - 2026-07-18
+
+- Add configurable row highlighting for suspicious and high-risk traffic.
+- Add Balanced, Subtle, High contrast, and Custom highlight presets, with Balanced enabled by default.
+- Keep selected rows visually distinct from risk highlighting.
+
 ## 0.7.0 - 2026-07-18
 
 - Add stateful suspicious-traffic detection for HTTP, HTTPS, and WebSocket sessions.

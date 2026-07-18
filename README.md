@@ -120,6 +120,8 @@ WebSocket messages appear as `WS` rows. `OUT` means client-to-server and `IN` me
 
 Traffic warnings are enabled by default under **File > Settings**. Suspicious rows show a warning symbol in the Alert column; hover over it for evidence or select the row and open **Warnings**. Scores combine independent indicators, so an ordinary API request with a missing User-Agent remains a notice while stronger or repeated evidence becomes a visible warning.
 
+Suspicious and high-risk rows are also highlighted using the **Balanced** preset by default. **File > Settings > Warnings** can disable row highlighting, switch between **Balanced**, **Subtle**, and **High contrast** presets, or edit the two color swatches to create a custom preset. The normal blue selection color always takes priority over risk highlighting.
+
 The detector observes raw IP destinations, random-looking hosts, repeated first-seen destinations, fixed-interval HTTP and WebSocket beaconing, long-running WebSocket activity, C2-style paths, URL shorteners and commonly abused hosting/tunnel services, unusual processes and User-Agents, malformed headers, proxy and tunneling indicators, large uploads, encoded outbound messages, outbound traffic spikes, repeated failures followed by alternate destinations, TLS validation failures, and credentials, cookies, files, screenshots, or system information sent over plaintext HTTP. On Windows, HTTP Whisper resolves loopback connections to their PID and executable and can warn when suspicious outbound traffic occurs after the configured system-idle threshold.
 
 Use filters such as `warning:true`, `risk:high`, `score:>=30`, `process:powershell.exe`, or `pid:1234` to isolate findings.
