@@ -1,12 +1,16 @@
 # Changelog
 
-## 0.6.0 - 2026-07-17
+## 0.6.1 - 2026-07-18
 
-- Add interactive request and response breakpoints with method, host, path, and status matching.
-- Add a live paused-traffic queue with editable request URLs, bodies, and response statuses.
-- Add request and response header editing under a collapsed Advanced section.
-- Add Forward and Drop decisions, plus enabled switches for temporarily disabling rules.
-- Support wildcard and `re:` regular-expression notation in every breakpoint match field.
+- Remove the interactive breakpoint editor introduced in 0.6.0, including Forward, Drop, and header editing.
+- Restore the simpler classic workflow from 0.5.1 while keeping all earlier capture and rewrite features.
+- Add an official Linux x86_64 release archive and repeatable Linux packaging script.
+- Keep automatic system proxy, Firefox policy, CA trust, and sign-in startup integration on Windows; Linux displays the manual setup path instead.
+
+## 0.6.0 - 2026-07-17 (superseded)
+
+- Introduced interactive traffic breakpoints with Forward, Drop, and advanced header editing.
+- Superseded by 0.6.1, which removes this workflow and restores the simpler classic interface.
 
 ## 0.5.1 - 2026-07-17
 

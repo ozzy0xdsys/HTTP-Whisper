@@ -1,8 +1,8 @@
 [package]
 name = "http-whisper"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
-description = "A native Windows HTTP/HTTPS and WebSocket debugging proxy"
+description = "A native HTTP/HTTPS and WebSocket debugging proxy for Windows and Linux"
 license = "MIT"
 
 [dependencies]

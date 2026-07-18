@@ -404,7 +404,7 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use anyhow::Result;
+    use anyhow::{Result, bail};
     use std::path::PathBuf;
 
     pub struct Manager;
@@ -416,7 +416,9 @@ mod platform {
             Ok(false)
         }
         pub fn enable(&mut self, _host: &str, _port: u16) -> Result<()> {
-            Ok(())
+            bail!(
+                "automatic system proxy configuration is only available on Windows; disable it and configure your Linux desktop or browser manually"
+            )
         }
         pub fn restore(&mut self) -> Result<()> {
             Ok(())
@@ -431,11 +433,25 @@ mod platform {
     }
 
     pub fn install_firefox_support() -> Result<()> {
-        Ok(())
+        bail!(
+            "automatic Firefox trust installation is only available on Windows; install the CA from http://mitm.it/"
+        )
     }
 
     pub fn configure_startup(_enabled: bool) -> Result<()> {
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Manager;
+
+        #[test]
+        fn unsupported_linux_integrations_report_an_error() {
+            let mut manager = Manager::new(std::path::PathBuf::from("proxy-restore.json"));
+            assert!(manager.enable("127.0.0.1", 8899).is_err());
+            assert!(super::install_firefox_support().is_err());
+        }
     }
 }
 

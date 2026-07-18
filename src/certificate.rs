@@ -1,6 +1,11 @@
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf};
 
-use anyhow::{Context, Result, bail};
+#[cfg(windows)]
+use std::process::Command;
+
+#[cfg(windows)]
+use anyhow::bail;
+use anyhow::{Context, Result};
 use hudsucker::{
     certificate_authority::RcgenAuthority,
     rcgen::{
@@ -81,6 +86,12 @@ pub fn install_current_user_ca(certificate: &std::path::Path) -> Result<()> {
         }
     }
     #[cfg(not(windows))]
-    let _ = certificate;
+    {
+        let _ = certificate;
+        anyhow::bail!(
+            "automatic CA trust installation is only available on Windows; start capture and install the CA from http://mitm.it/"
+        );
+    }
+    #[cfg(windows)]
     Ok(())
 }

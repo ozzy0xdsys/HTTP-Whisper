@@ -1,9 +1,6 @@
 use regex::RegexBuilder;
 
-use crate::{
-    config::{AutoResponseRule, BreakpointRule, ResponseRewriteRule},
-    model::BreakpointPhase,
-};
+use crate::config::{AutoResponseRule, ResponseRewriteRule};
 
 pub fn host_is_hidden(host: &str, hidden_hosts: &[String]) -> bool {
     hidden_hosts
@@ -33,27 +30,6 @@ pub fn matching_rewrites<'a>(
         .iter()
         .filter(|rule| !rule.find_text.is_empty() && pattern_matches(&rule.host, host, false))
         .collect()
-}
-
-pub fn find_breakpoint<'a>(
-    phase: BreakpointPhase,
-    method: &str,
-    host: &str,
-    path: &str,
-    status: Option<u16>,
-    rules: &'a [BreakpointRule],
-) -> Option<&'a BreakpointRule> {
-    rules.iter().find(|rule| {
-        rule.enabled
-            && rule.phase == phase
-            && (rule.method.is_empty() || pattern_matches(&rule.method, method, false))
-            && pattern_matches(&rule.host, host, false)
-            && pattern_matches(&rule.path, path, true)
-            && (phase == BreakpointPhase::Request
-                || rule.status.is_empty()
-                || status
-                    .is_some_and(|value| pattern_matches(&rule.status, &value.to_string(), true)))
-    })
 }
 
 pub fn apply_rewrite(text: &str, rule: &ResponseRewriteRule) -> (String, usize) {
@@ -191,41 +167,6 @@ mod tests {
         assert_eq!(
             apply_rewrite("user-12 and user-34", &rule),
             ("account-12 and account-34".into(), 2)
-        );
-    }
-
-    #[test]
-    fn breakpoints_match_phase_and_regex_fields() {
-        let rules = [BreakpointRule {
-            enabled: true,
-            phase: BreakpointPhase::Response,
-            method: "re:^(GET|POST)$".into(),
-            host: "re:^api\\d+\\.example\\.com$".into(),
-            path: "re:^/users/\\d+$".into(),
-            status: "re:^4\\d\\d$".into(),
-            ..Default::default()
-        }];
-        assert!(
-            find_breakpoint(
-                BreakpointPhase::Response,
-                "GET",
-                "API12.EXAMPLE.COM",
-                "/users/42",
-                Some(403),
-                &rules,
-            )
-            .is_some()
-        );
-        assert!(
-            find_breakpoint(
-                BreakpointPhase::Request,
-                "GET",
-                "api12.example.com",
-                "/users/42",
-                None,
-                &rules,
-            )
-            .is_none()
         );
     }
 }

@@ -1,6 +1,6 @@
 # HTTP Whisper
 
-HTTP Whisper is a native Windows HTTP, HTTPS, and WebSocket debugging proxy written in Rust. It uses a classic Windows XP-style desktop interface and automatically prepares Windows and Firefox for local interception while capture is active.
+HTTP Whisper is a native Windows and Linux HTTP, HTTPS, and WebSocket debugging proxy written in Rust. It uses a compact classic Windows XP-style desktop interface. Windows proxy, certificate, and Firefox setup is automatic while capture is active; Linux uses manual browser or desktop proxy setup.
 
 ## Features
 
@@ -9,12 +9,11 @@ HTTP Whisper is a native Windows HTTP, HTTPS, and WebSocket debugging proxy writ
 - Crash-recovery snapshot for interrupted Windows proxy changes
 - Automatic local CA generation and current-user Root store installation
 - Automatic Firefox system-proxy policy and enterprise-root trust
-- Optional current-user Windows startup registration and launch-time auto-connect
+- Optional current-user Windows startup registration and cross-platform launch-time auto-connect
 - Local `mitm.it` certificate install page while capture is running
 - Live HTTP requests and responses with raw Authorization headers visible in the inspector
 - Live incoming and outgoing WebSocket messages
 - Binary WebSocket decoding for UTF-8, gzip, zlib, raw deflate, and zlib-stream
-- Interactive request and response breakpoints with editable traffic and Forward or Drop decisions
 - Host/path/method automatic response rules with wildcard and `re:` regular-expression matching
 - HTTP and decoded WebSocket text replacement rules with regex capture replacements
 - Case-sensitive and case-insensitive response replacements
@@ -24,7 +23,7 @@ HTTP Whisper is a native Windows HTTP, HTTPS, and WebSocket debugging proxy writ
 - Pinning, URL copy, JSON/HAR/cURL export APIs, body storage, and SQLite session storage
 - Redacted Authorization, cookie, and proxy credentials in exported data
 
-## Build
+## Windows Build
 
 Install the stable Rust toolchain with the MSVC target, then run:
 
@@ -48,7 +47,20 @@ Create an optimized executable:
 
 The packaged executable is written to `dist\HTTP-Whisper.exe`.
 
-## Capture
+## Linux Build
+
+Install Rust and the development libraries used by `eframe`, then run:
+
+```bash
+sudo apt-get install libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
+  libxcursor-dev libxrandr-dev libxinerama-dev libgl1-mesa-dev \
+  libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+./scripts/package-linux.sh
+```
+
+The packaged archive is written to `dist/HTTP-Whisper-linux-x86_64.tar.gz`. GitHub releases include this archive alongside `HTTP-Whisper.exe` and their SHA-256 files.
+
+## Windows Capture
 
 Click **Start Capture**. HTTP Whisper will:
 
@@ -62,17 +74,15 @@ Firefox must be restarted after its enterprise policy is installed if it was alr
 
 With capture running, `http://mitm.it/` is handled locally by HTTP Whisper and serves the current HTTP Whisper CA as DER or PEM. If Firefox shows a public proxy warning page, Firefox is not using HTTP Whisper yet; accept the UAC prompt if shown, fully close Firefox, reopen it, and try `http://mitm.it/` again.
 
+## Linux Capture
+
+Start capture, configure your browser or desktop HTTP and HTTPS proxy as `127.0.0.1:8899`, then open `http://mitm.it/` through that proxy and install the CA in the browser or Linux trust store. Linux desktop proxy settings, CA stores, and startup methods vary by distribution, so HTTP Whisper leaves those system changes manual and restores nothing it did not change.
+
 ## Startup
 
-Open **File > Settings** to enable **Start HTTP Whisper** and **Auto-connect** independently. Start HTTP Whisper adds the current executable to the current user's Windows startup registry entry without requiring administrator rights. Auto-connect starts capture immediately whenever the app launches, using the configured host, port, certificate, Firefox, and Windows proxy settings.
+On Windows, open **File > Settings** to enable **Start HTTP Whisper** and **Auto-connect** independently. Start HTTP Whisper adds the current executable to the current user's Windows startup registry entry without requiring administrator rights. Auto-connect is available on both platforms and starts capture immediately whenever the app launches.
 
 Enable both options to launch HTTP Whisper at Windows sign-in and begin capturing automatically. Moving the executable is supported: the startup path is refreshed whenever HTTP Whisper runs or Settings are saved.
-
-## Breakpoints
-
-Open **Tools > Breakpoints** to create request or response breakpoint rules. Rules can match Method, Host, Path, and response Status with wildcards or `re:` regular expressions, and can be disabled without deleting them.
-
-When a rule matches, HTTP Whisper opens the Paused view. Request breakpoints allow the URL and body to be edited; response breakpoints allow the status and body to be edited. Expand **Advanced** to edit headers. Choose **Forward** to continue with the edited traffic or **Drop** to block it. Multiple matches remain in the paused queue and can be handled independently.
 
 ## Automatic Responses
 
@@ -106,7 +116,7 @@ WebSocket messages appear as `WS` rows. `OUT` means client-to-server and `IN` me
 
 ## Data And Security
 
-Settings, certificates, bodies, and session metadata are stored under `%LOCALAPPDATA%\HTTP Whisper\HTTP Whisper`. These files can contain sensitive traffic and credentials. Raw headers remain visible inside the local inspector, while exports redact Authorization, proxy authorization, cookies, and set-cookie values.
+On Windows, settings, certificates, bodies, and session metadata are stored under `%LOCALAPPDATA%\HTTP Whisper\HTTP Whisper`. On Linux they use the platform application-data directory, normally under `~/.local/share`. These files can contain sensitive traffic and credentials. Raw headers remain visible inside the local inspector, while exports redact Authorization, proxy authorization, cookies, and set-cookie values.
 
 Only inspect systems and traffic that you own or are explicitly authorized to inspect.
 

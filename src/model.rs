@@ -95,46 +95,6 @@ pub enum Direction {
     In,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BreakpointPhase {
-    #[default]
-    Request,
-    Response,
-}
-
-impl BreakpointPhase {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Request => "Request",
-            Self::Response => "Response",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BreakpointAction {
-    Forward,
-    Drop,
-}
-
-#[derive(Clone, Debug)]
-pub struct PausedBreakpoint {
-    pub id: Uuid,
-    pub rule_name: String,
-    pub phase: BreakpointPhase,
-    pub request: CapturedRequest,
-    pub response: Option<CapturedResponse>,
-}
-
-#[derive(Clone, Debug)]
-pub struct BreakpointDecision {
-    pub id: Uuid,
-    pub action: BreakpointAction,
-    pub request: CapturedRequest,
-    pub response: Option<CapturedResponse>,
-}
-
 impl Direction {
     pub fn label(self) -> &'static str {
         match self {
@@ -151,7 +111,6 @@ pub enum CaptureEvent {
     Started { host: String, port: u16 },
     Log(String),
     Exchange(CapturedExchange),
-    BreakpointPaused(PausedBreakpoint),
     ReplayCompleted(CapturedExchange),
     WebSocket(WebSocketMessage),
     OperationError(String),
