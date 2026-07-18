@@ -635,8 +635,15 @@ impl HttpWhisperApp {
                                         row_values(session).into_iter().enumerate()
                                     {
                                         row.col(|ui| {
-                                            paint_table_cell(ui, colors.for_value_column(index));
-                                            ui.add(egui::Label::new(value).truncate());
+                                            let background = colors.for_value_column(index);
+                                            paint_table_cell(ui, background);
+                                            let text = match background {
+                                                Some(color) => {
+                                                    RichText::new(value).color(inverse_color(color))
+                                                }
+                                                None => RichText::new(value),
+                                            };
+                                            ui.add(egui::Label::new(text).truncate());
                                         });
                                     }
                                     let response = row.response();
@@ -1221,7 +1228,7 @@ impl HttpWhisperApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     ui.heading("HTTP Whisper");
-                    ui.label("Version 0.7.2");
+                    ui.label("Version 0.7.3");
                     ui.add_space(8.0);
                     ui.label("Native Rust HTTP/HTTPS and WebSocket debugging workbench");
                     ui.label("Classic Windows XP interface");
@@ -1610,6 +1617,10 @@ fn paint_table_cell(ui: &mut Ui, color: Option<Color32>) {
         .rect_filled(rect, egui::CornerRadius::ZERO, color);
 }
 
+fn inverse_color(color: Color32) -> Color32 {
+    Color32::from_rgb(255 - color.r(), 255 - color.g(), 255 - color.b())
+}
+
 fn highlight_preview(ui: &mut Ui, label: &str, color: [u8; 3]) {
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), egui::Sense::hover());
@@ -1627,7 +1638,7 @@ fn highlight_preview(ui: &mut Ui, label: &str, color: [u8; 3]) {
         egui::Align2::LEFT_CENTER,
         label,
         FontId::proportional(12.0),
-        XP_TEXT,
+        inverse_color(fill),
     );
 }
 
@@ -2046,5 +2057,19 @@ mod tests {
         assert!(status_pattern_matches("5*", 503));
         assert!(status_pattern_matches("re:^20[01]$", 201));
         assert!(!status_pattern_matches("4xx", 500));
+    }
+
+    #[test]
+    fn table_text_color_is_the_exact_rgb_inverse() {
+        assert_eq!(inverse_color(Color32::BLACK), Color32::WHITE);
+        assert_eq!(inverse_color(Color32::WHITE), Color32::BLACK);
+        assert_eq!(
+            inverse_color(Color32::from_rgb(1, 2, 3)),
+            Color32::from_rgb(254, 253, 252)
+        );
+        assert_eq!(
+            inverse_color(Color32::from_rgb(255, 218, 218)),
+            Color32::from_rgb(0, 37, 37)
+        );
     }
 }

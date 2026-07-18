@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.3 - 2026-07-18
+
+- Automatically render table text using the exact inverse RGB color of each configured background.
+- Apply the same inverse text calculation to table-color previews in Settings.
+
 ## 0.7.2 - 2026-07-18
 
 - Replace threat-driven row fills with independent Host and Status code table-color rules.
