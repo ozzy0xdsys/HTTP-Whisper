@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.2 - 2026-07-18
+
+- Replace threat-driven row fills with independent Host and Status code table-color rules.
+- Add whole-row and matched-column color targets with editable colors and wildcard or regex matching.
+- Add a default HTTP status preset for `3xx`, `4xx`, and `5xx` responses.
+- Show suspicious-traffic warnings only through the Alert column warning icon.
+
 ## 0.7.1 - 2026-07-18
 
 - Add configurable row highlighting for suspicious and high-risk traffic.

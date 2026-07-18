@@ -10,13 +10,17 @@ use uuid::Uuid;
 
 use crate::{
     capture::CaptureWorker,
-    config::{AppPaths, AppSettings, AutoResponseRule, ResponseRewriteRule, RowHighlightPreset},
+    config::{
+        AppPaths, AppSettings, AutoResponseRule, ResponseRewriteRule, TableColorField,
+        TableColorPreset, TableColorRule, TableColorTarget,
+    },
     filtering::matches_filter,
     model::{
         CaptureEvent, CapturedExchange, CapturedRequest, CapturedResponse, Header, Session,
         ThreatAssessment, ThreatLevel, WebSocketMessage, headers_as_text,
     },
     platform,
+    rules::pattern_matches,
     storage::SessionRepository,
     threat::ThreatAnalyzer,
     windows_proxy::configure_startup,
@@ -65,6 +69,7 @@ pub struct HttpWhisperApp {
     filter: String,
     tab: usize,
     settings_tab: usize,
+    table_color_selected: usize,
     dialog: Option<DialogKind>,
     state: String,
     ca_state: String,
@@ -103,6 +108,7 @@ impl HttpWhisperApp {
             filter: String::new(),
             tab: 0,
             settings_tab: 0,
+            table_color_selected: 0,
             dialog: None,
             state: "Idle".into(),
             ca_state: if cfg!(windows) {
@@ -292,6 +298,12 @@ impl HttpWhisperApp {
             DialogKind::Settings => {
                 self.settings_draft = self.settings.clone();
                 self.hidden_hosts_draft = self.settings.hidden_hosts.join("\n");
+                self.table_color_selected = self.table_color_selected.min(
+                    self.settings_draft
+                        .table_color_rules
+                        .len()
+                        .saturating_sub(1),
+                );
             }
             DialogKind::AutoResponses => {
                 self.auto_draft = self.settings.auto_response_rules.clone();
@@ -612,16 +624,18 @@ impl HttpWhisperApp {
                                     let session = &rows[row.index()];
                                     let id = session.id();
                                     let is_selected = self.selected == Some(id);
-                                    let highlight =
-                                        row_highlight_color(&self.settings, session, is_selected);
+                                    let colors =
+                                        table_cell_colors(&self.settings, session, is_selected);
                                     row.set_selected(is_selected);
                                     row.col(|ui| {
-                                        paint_row_cell(ui, highlight);
+                                        paint_table_cell(ui, colors.row);
                                         threat_indicator(ui, session.threat());
                                     });
-                                    for value in row_values(session) {
+                                    for (index, value) in
+                                        row_values(session).into_iter().enumerate()
+                                    {
                                         row.col(|ui| {
-                                            paint_row_cell(ui, highlight);
+                                            paint_table_cell(ui, colors.for_value_column(index));
                                             ui.add(egui::Label::new(value).truncate());
                                         });
                                     }
@@ -747,20 +761,23 @@ impl HttpWhisperApp {
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
-            .fixed_size([460.0, 280.0])
+            .fixed_size([460.0, 250.0])
             .show(ui.ctx(), |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.settings_tab, 0, "General");
                     ui.selectable_value(&mut self.settings_tab, 1, "Warnings");
+                    ui.selectable_value(&mut self.settings_tab, 2, "Colors");
                 });
                 ui.separator();
                 ScrollArea::vertical()
                     .id_salt("settings-page")
                     .auto_shrink([false, false])
-                    .max_height(180.0)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .max_height(150.0)
                     .show(ui, |ui| match self.settings_tab {
                         0 => self.settings_general_tab(ui),
-                        _ => self.settings_warnings_tab(ui),
+                        1 => self.settings_warnings_tab(ui),
+                        _ => self.settings_colors_tab(ui),
                     });
                 ui.add_space(4.0);
                 ui.separator();
@@ -851,59 +868,133 @@ impl HttpWhisperApp {
                         .suffix(" min"),
                 );
                 ui.end_row();
-                ui.label("Row highlighting");
-                ui.checkbox(
-                    &mut self.settings_draft.row_highlighting_enabled,
-                    "Highlight suspicious rows",
-                );
+            });
+    }
+
+    fn settings_colors_tab(&mut self, ui: &mut Ui) {
+        let mut preset = self.settings_draft.table_color_preset;
+        egui::Grid::new("settings-color-preset-grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Preset");
+                egui::ComboBox::from_id_salt("table-color-preset")
+                    .selected_text(preset.label())
+                    .show_ui(ui, |ui| {
+                        for option in TableColorPreset::ALL {
+                            ui.selectable_value(&mut preset, option, option.label());
+                        }
+                    });
                 ui.end_row();
-                ui.label("Highlight preset");
-                let mut preset = self.settings_draft.row_highlight_preset;
-                ui.add_enabled_ui(self.settings_draft.row_highlighting_enabled, |ui| {
-                    egui::ComboBox::from_id_salt("row-highlight-preset")
-                        .selected_text(preset.label())
-                        .show_ui(ui, |ui| {
-                            for option in RowHighlightPreset::ALL {
-                                ui.selectable_value(&mut preset, option, option.label());
-                            }
-                        });
+            });
+        if preset != self.settings_draft.table_color_preset {
+            self.settings_draft.apply_table_color_preset(preset);
+            self.table_color_selected = 0;
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Rule");
+            let selected_name = self
+                .settings_draft
+                .table_color_rules
+                .get(self.table_color_selected)
+                .map(|rule| rule.name.as_str())
+                .unwrap_or("No rules");
+            egui::ComboBox::from_id_salt("table-color-rule")
+                .selected_text(selected_name)
+                .show_ui(ui, |ui| {
+                    for (index, rule) in self.settings_draft.table_color_rules.iter().enumerate() {
+                        ui.selectable_value(&mut self.table_color_selected, index, &rule.name);
+                    }
                 });
-                if preset != self.settings_draft.row_highlight_preset {
-                    self.settings_draft.apply_row_highlight_preset(preset);
+            if ui.button("+").on_hover_text("Add color rule").clicked() {
+                let number = self.settings_draft.table_color_rules.len() + 1;
+                let rule = TableColorRule {
+                    name: format!("Table color {number}"),
+                    ..Default::default()
+                };
+                self.settings_draft.table_color_rules.push(rule);
+                self.table_color_selected = number - 1;
+                self.settings_draft.table_color_preset = TableColorPreset::Custom;
+            }
+            let can_remove = !self.settings_draft.table_color_rules.is_empty();
+            if ui
+                .add_enabled(can_remove, egui::Button::new("-"))
+                .on_hover_text("Remove selected color rule")
+                .clicked()
+            {
+                self.settings_draft
+                    .table_color_rules
+                    .remove(self.table_color_selected);
+                self.table_color_selected = self.table_color_selected.min(
+                    self.settings_draft
+                        .table_color_rules
+                        .len()
+                        .saturating_sub(1),
+                );
+                self.settings_draft.table_color_preset = TableColorPreset::Custom;
+            }
+        });
+
+        let Some(rule) = self
+            .settings_draft
+            .table_color_rules
+            .get_mut(self.table_color_selected)
+        else {
+            return;
+        };
+        let mut changed = false;
+        egui::Grid::new("settings-color-rule-grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Enabled");
+                changed |= ui.checkbox(&mut rule.enabled, "Use this rule").changed();
+                ui.end_row();
+                ui.label("Name");
+                changed |= ui.text_edit_singleline(&mut rule.name).changed();
+                ui.end_row();
+                ui.label("Match field");
+                let previous_field = rule.field;
+                egui::ComboBox::from_id_salt("table-color-field")
+                    .selected_text(rule.field.label())
+                    .show_ui(ui, |ui| {
+                        for field in TableColorField::ALL {
+                            ui.selectable_value(&mut rule.field, field, field.label());
+                        }
+                    });
+                if rule.field != previous_field {
+                    rule.pattern = match rule.field {
+                        TableColorField::Host => "*.example.com".into(),
+                        TableColorField::StatusCode => "4xx".into(),
+                    };
+                    changed = true;
                 }
                 ui.end_row();
-                ui.label("Suspicious color");
-                let suspicious_changed = ui
-                    .add_enabled_ui(self.settings_draft.row_highlighting_enabled, |ui| {
-                        ui.color_edit_button_srgb(&mut self.settings_draft.suspicious_row_color)
-                    })
-                    .inner
-                    .changed();
+                ui.label("Match value");
+                changed |= ui.text_edit_singleline(&mut rule.pattern).changed();
                 ui.end_row();
-                ui.label("High-risk color");
-                let high_changed = ui
-                    .add_enabled_ui(self.settings_draft.row_highlighting_enabled, |ui| {
-                        ui.color_edit_button_srgb(&mut self.settings_draft.high_risk_row_color)
-                    })
-                    .inner
-                    .changed();
-                if suspicious_changed || high_changed {
-                    self.settings_draft.row_highlight_preset = RowHighlightPreset::Custom;
-                }
+                ui.label("Apply to");
+                let previous_target = rule.target;
+                egui::ComboBox::from_id_salt("table-color-target")
+                    .selected_text(rule.target.label())
+                    .show_ui(ui, |ui| {
+                        for target in TableColorTarget::ALL {
+                            ui.selectable_value(&mut rule.target, target, target.label());
+                        }
+                    });
+                changed |= rule.target != previous_target;
+                ui.end_row();
+                ui.label("Color");
+                changed |= ui.color_edit_button_srgb(&mut rule.color).changed();
                 ui.end_row();
             });
         ui.separator();
-        ui.label("Preview");
-        highlight_preview(
-            ui,
-            "Suspicious traffic",
-            self.settings_draft.suspicious_row_color,
-        );
-        highlight_preview(
-            ui,
-            "High-risk traffic",
-            self.settings_draft.high_risk_row_color,
-        );
+        highlight_preview(ui, &rule.name, rule.color);
+        if changed {
+            self.settings_draft.table_color_preset = TableColorPreset::Custom;
+        }
     }
 
     fn auto_responses_dialog(&mut self, ui: &mut Ui) {
@@ -1130,7 +1221,7 @@ impl HttpWhisperApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     ui.heading("HTTP Whisper");
-                    ui.label("Version 0.7.1");
+                    ui.label("Version 0.7.2");
                     ui.add_space(8.0);
                     ui.label("Native Rust HTTP/HTTPS and WebSocket debugging workbench");
                     ui.label("Classic Windows XP interface");
@@ -1432,23 +1523,84 @@ fn threat_indicator(ui: &mut Ui, threat: &ThreatAssessment) {
     response.on_hover_text(threat.tooltip());
 }
 
-fn row_highlight_color(
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TableCellColors {
+    row: Option<Color32>,
+    host: Option<Color32>,
+    status: Option<Color32>,
+}
+
+impl TableCellColors {
+    fn for_value_column(self, index: usize) -> Option<Color32> {
+        match index {
+            8 => self.host.or(self.row),
+            11 => self.status.or(self.row),
+            _ => self.row,
+        }
+    }
+}
+
+fn table_cell_colors(
     settings: &AppSettings,
     session: &Session,
     is_selected: bool,
-) -> Option<Color32> {
-    if !settings.row_highlighting_enabled || is_selected {
-        return None;
+) -> TableCellColors {
+    if is_selected {
+        return TableCellColors::default();
     }
-    let color = match session.threat().level {
-        ThreatLevel::Suspicious => settings.suspicious_row_color,
-        ThreatLevel::High => settings.high_risk_row_color,
-        ThreatLevel::None | ThreatLevel::Notice => return None,
-    };
-    Some(Color32::from_rgb(color[0], color[1], color[2]))
+    let mut colors = TableCellColors::default();
+    for rule in settings
+        .table_color_rules
+        .iter()
+        .filter(|rule| rule.enabled && table_color_rule_matches(rule, session))
+    {
+        let color = Color32::from_rgb(rule.color[0], rule.color[1], rule.color[2]);
+        match (rule.target, rule.field) {
+            (TableColorTarget::EntireRow, _) => colors.row = Some(color),
+            (TableColorTarget::MatchedColumn, TableColorField::Host) => {
+                colors.host = Some(color);
+            }
+            (TableColorTarget::MatchedColumn, TableColorField::StatusCode) => {
+                colors.status = Some(color);
+            }
+        }
+    }
+    colors
 }
 
-fn paint_row_cell(ui: &mut Ui, color: Option<Color32>) {
+fn table_color_rule_matches(rule: &TableColorRule, session: &Session) -> bool {
+    match rule.field {
+        TableColorField::Host => {
+            let host = match session {
+                Session::Http(exchange) => &exchange.request.host,
+                Session::WebSocket(message) => &message.host,
+            };
+            pattern_matches(rule.pattern.trim(), host, false)
+        }
+        TableColorField::StatusCode => {
+            let Session::Http(exchange) = session else {
+                return false;
+            };
+            exchange.response.as_ref().is_some_and(|response| {
+                status_pattern_matches(rule.pattern.trim(), response.status)
+            })
+        }
+    }
+}
+
+fn status_pattern_matches(pattern: &str, status: u16) -> bool {
+    let bytes = pattern.as_bytes();
+    if bytes.len() == 3
+        && bytes[0].is_ascii_digit()
+        && bytes[1].eq_ignore_ascii_case(&b'x')
+        && bytes[2].eq_ignore_ascii_case(&b'x')
+    {
+        return u16::from(bytes[0] - b'0') == status / 100;
+    }
+    pattern_matches(pattern, &status.to_string(), false)
+}
+
+fn paint_table_cell(ui: &mut Ui, color: Option<Color32>) {
     let Some(color) = color else { return };
     let rect = ui
         .max_rect()
@@ -1838,28 +1990,61 @@ mod tests {
     }
 
     #[test]
-    fn row_highlight_respects_risk_selection_and_settings() {
+    fn warning_risk_does_not_color_rows() {
         let mut settings = AppSettings::default();
         let mut session = sample_sessions().remove(0);
         if let Session::Http(exchange) = &mut session {
-            exchange.threat.level = ThreatLevel::Suspicious;
-        }
-
-        assert_eq!(
-            row_highlight_color(&settings, &session, false),
-            Some(Color32::from_rgb(255, 244, 190))
-        );
-        assert_eq!(row_highlight_color(&settings, &session, true), None);
-
-        if let Session::Http(exchange) = &mut session {
             exchange.threat.level = ThreatLevel::High;
         }
+        settings.table_color_rules.clear();
         assert_eq!(
-            row_highlight_color(&settings, &session, false),
-            Some(Color32::from_rgb(255, 210, 204))
+            table_cell_colors(&settings, &session, false),
+            TableCellColors::default()
+        );
+    }
+
+    #[test]
+    fn table_colors_match_status_host_scope_and_selection() {
+        let mut session = sample_sessions().remove(3);
+        let settings = AppSettings::default();
+        let colors = table_cell_colors(&settings, &session, false);
+        assert_eq!(colors.row, None);
+        assert_eq!(colors.status, Some(Color32::from_rgb(255, 241, 184)));
+        assert_eq!(colors.host, None);
+
+        let custom = AppSettings {
+            table_color_rules: vec![TableColorRule {
+                field: TableColorField::Host,
+                pattern: "re:^storage\\.example\\.com$".into(),
+                target: TableColorTarget::EntireRow,
+                color: [1, 2, 3],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            table_cell_colors(&custom, &session, false).row,
+            Some(Color32::from_rgb(1, 2, 3))
+        );
+        assert_eq!(
+            table_cell_colors(&custom, &session, true),
+            TableCellColors::default()
         );
 
-        settings.row_highlighting_enabled = false;
-        assert_eq!(row_highlight_color(&settings, &session, false), None);
+        if let Session::Http(exchange) = &mut session
+            && let Some(response) = &mut exchange.response
+        {
+            response.status = 503;
+        }
+        let colors = table_cell_colors(&settings, &session, false);
+        assert_eq!(colors.row, Some(Color32::from_rgb(255, 218, 218)));
+    }
+
+    #[test]
+    fn status_patterns_support_classes_wildcards_and_regex() {
+        assert!(status_pattern_matches("4xx", 404));
+        assert!(status_pattern_matches("5*", 503));
+        assert!(status_pattern_matches("re:^20[01]$", 201));
+        assert!(!status_pattern_matches("4xx", 500));
     }
 }

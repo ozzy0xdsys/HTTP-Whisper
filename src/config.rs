@@ -101,37 +101,140 @@ impl Default for ResponseRewriteRule {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RowHighlightPreset {
+pub enum TableColorPreset {
     #[default]
-    Balanced,
-    Subtle,
-    HighContrast,
+    HttpStatus,
+    NoColors,
     Custom,
 }
 
-impl RowHighlightPreset {
-    pub const ALL: [Self; 4] = [
-        Self::Balanced,
-        Self::Subtle,
-        Self::HighContrast,
-        Self::Custom,
-    ];
+impl TableColorPreset {
+    pub const ALL: [Self; 3] = [Self::HttpStatus, Self::NoColors, Self::Custom];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Balanced => "Balanced",
-            Self::Subtle => "Subtle",
-            Self::HighContrast => "High contrast",
+            Self::HttpStatus => "HTTP status (default)",
+            Self::NoColors => "No table colors",
             Self::Custom => "Custom",
         }
     }
 
-    pub fn colors(self) -> Option<([u8; 3], [u8; 3])> {
+    pub fn rules(self) -> Option<Vec<TableColorRule>> {
         match self {
-            Self::Balanced => Some(([255, 244, 190], [255, 210, 204])),
-            Self::Subtle => Some(([255, 250, 224], [255, 235, 232])),
-            Self::HighContrast => Some(([255, 225, 88], [255, 166, 150])),
+            Self::HttpStatus => Some(vec![
+                TableColorRule {
+                    name: "Server errors".into(),
+                    field: TableColorField::StatusCode,
+                    pattern: "5xx".into(),
+                    target: TableColorTarget::EntireRow,
+                    color: [255, 218, 218],
+                    ..Default::default()
+                },
+                TableColorRule {
+                    name: "Client errors".into(),
+                    field: TableColorField::StatusCode,
+                    pattern: "4xx".into(),
+                    target: TableColorTarget::MatchedColumn,
+                    color: [255, 241, 184],
+                    ..Default::default()
+                },
+                TableColorRule {
+                    name: "Redirects".into(),
+                    field: TableColorField::StatusCode,
+                    pattern: "3xx".into(),
+                    target: TableColorTarget::MatchedColumn,
+                    color: [218, 235, 255],
+                    ..Default::default()
+                },
+            ]),
+            Self::NoColors => Some(Vec::new()),
             Self::Custom => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TableColorField {
+    #[default]
+    Host,
+    StatusCode,
+}
+
+impl TableColorField {
+    pub const ALL: [Self; 2] = [Self::Host, Self::StatusCode];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Host => "Host",
+            Self::StatusCode => "Status code",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TableColorTarget {
+    #[default]
+    EntireRow,
+    MatchedColumn,
+}
+
+impl TableColorTarget {
+    pub const ALL: [Self; 2] = [Self::EntireRow, Self::MatchedColumn];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EntireRow => "Entire row",
+            Self::MatchedColumn => "Matched column",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TableColorRule {
+    pub name: String,
+    pub enabled: bool,
+    pub field: TableColorField,
+    pub pattern: String,
+    pub target: TableColorTarget,
+    pub color: [u8; 3],
+}
+
+impl TableColorRule {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.name.trim().is_empty(), "table color name is required");
+        anyhow::ensure!(
+            !self.pattern.trim().is_empty(),
+            "table color match value is required"
+        );
+        validate_regex_field("table color match", &self.pattern)?;
+        if self.field == TableColorField::StatusCode
+            && self
+                .pattern
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        {
+            let status = self.pattern.parse::<u16>().unwrap_or_default();
+            anyhow::ensure!(
+                (100..=599).contains(&status),
+                "exact status color matches must be between 100 and 599"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Default for TableColorRule {
+    fn default() -> Self {
+        Self {
+            name: "Host color".into(),
+            enabled: true,
+            field: TableColorField::Host,
+            pattern: "*.example.com".into(),
+            target: TableColorTarget::MatchedColumn,
+            color: [218, 235, 255],
         }
     }
 }
@@ -148,10 +251,8 @@ pub struct AppSettings {
     pub auto_connect: bool,
     pub threat_detection_enabled: bool,
     pub idle_warning_minutes: u64,
-    pub row_highlighting_enabled: bool,
-    pub row_highlight_preset: RowHighlightPreset,
-    pub suspicious_row_color: [u8; 3],
-    pub high_risk_row_color: [u8; 3],
+    pub table_color_preset: TableColorPreset,
+    pub table_color_rules: Vec<TableColorRule>,
     pub theme: String,
     pub autosave_interval_seconds: u64,
     pub body_memory_limit_bytes: usize,
@@ -163,8 +264,8 @@ pub struct AppSettings {
 
 impl Default for AppSettings {
     fn default() -> Self {
-        let (suspicious_row_color, high_risk_row_color) =
-            RowHighlightPreset::Balanced.colors().unwrap();
+        let table_color_preset = TableColorPreset::HttpStatus;
+        let table_color_rules = table_color_preset.rules().unwrap();
         Self {
             capture_host: "127.0.0.1".to_owned(),
             capture_port: 8899,
@@ -175,10 +276,8 @@ impl Default for AppSettings {
             auto_connect: false,
             threat_detection_enabled: true,
             idle_warning_minutes: 5,
-            row_highlighting_enabled: true,
-            row_highlight_preset: RowHighlightPreset::Balanced,
-            suspicious_row_color,
-            high_risk_row_color,
+            table_color_preset,
+            table_color_rules,
             theme: "system".to_owned(),
             autosave_interval_seconds: 30,
             body_memory_limit_bytes: 1_048_576,
@@ -191,11 +290,10 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
-    pub fn apply_row_highlight_preset(&mut self, preset: RowHighlightPreset) {
-        self.row_highlight_preset = preset;
-        if let Some((suspicious, high)) = preset.colors() {
-            self.suspicious_row_color = suspicious;
-            self.high_risk_row_color = high;
+    pub fn apply_table_color_preset(&mut self, preset: TableColorPreset) {
+        self.table_color_preset = preset;
+        if let Some(rules) = preset.rules() {
+            self.table_color_rules = rules;
         }
     }
 
@@ -260,6 +358,9 @@ impl AppSettings {
             rule.validate()?;
         }
         for rule in &self.response_rewrite_rules {
+            rule.validate()?;
+        }
+        for rule in &self.table_color_rules {
             rule.validate()?;
         }
         Ok(())
@@ -347,28 +448,37 @@ mod tests {
         assert!(!settings.auto_connect);
         assert!(settings.threat_detection_enabled);
         assert_eq!(settings.idle_warning_minutes, 5);
-        assert!(settings.row_highlighting_enabled);
-        assert_eq!(settings.row_highlight_preset, RowHighlightPreset::Balanced);
-        assert_eq!(settings.suspicious_row_color, [255, 244, 190]);
-        assert_eq!(settings.high_risk_row_color, [255, 210, 204]);
+        assert_eq!(settings.table_color_preset, TableColorPreset::HttpStatus);
+        assert_eq!(settings.table_color_rules.len(), 3);
+        assert_eq!(settings.table_color_rules[0].pattern, "5xx");
     }
 
     #[test]
-    fn row_highlight_presets_apply_colors_and_custom_preserves_them() {
+    fn table_color_presets_apply_rules_and_custom_preserves_them() {
         let mut settings = AppSettings::default();
-        settings.apply_row_highlight_preset(RowHighlightPreset::HighContrast);
-        assert_eq!(settings.suspicious_row_color, [255, 225, 88]);
-        assert_eq!(settings.high_risk_row_color, [255, 166, 150]);
+        settings.apply_table_color_preset(TableColorPreset::NoColors);
+        assert!(settings.table_color_rules.is_empty());
 
-        settings.suspicious_row_color = [1, 2, 3];
-        settings.apply_row_highlight_preset(RowHighlightPreset::Custom);
-        assert_eq!(settings.suspicious_row_color, [1, 2, 3]);
+        settings.table_color_rules.push(TableColorRule {
+            color: [1, 2, 3],
+            ..Default::default()
+        });
+        settings.apply_table_color_preset(TableColorPreset::Custom);
 
         let json = serde_json::to_string(&settings).unwrap();
         let restored: AppSettings = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.row_highlight_preset, RowHighlightPreset::Custom);
-        assert_eq!(restored.suspicious_row_color, [1, 2, 3]);
-        assert_eq!(restored.high_risk_row_color, [255, 166, 150]);
+        assert_eq!(restored.table_color_preset, TableColorPreset::Custom);
+        assert_eq!(restored.table_color_rules[0].color, [1, 2, 3]);
+    }
+
+    #[test]
+    fn rejects_invalid_table_color_rules() {
+        let mut settings = AppSettings::default();
+        settings.table_color_rules.push(TableColorRule {
+            pattern: "re:(unclosed".into(),
+            ..Default::default()
+        });
+        assert!(settings.validate().is_err());
     }
 
     #[cfg(not(windows))]
