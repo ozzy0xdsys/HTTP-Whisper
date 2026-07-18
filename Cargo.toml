@@ -1,22 +1,27 @@
 [package]
 name = "http-whisper"
-version = "0.7.3"
+version = "0.8.0"
 edition = "2024"
 description = "A native HTTP/HTTPS and WebSocket debugging proxy for Windows and Linux"
 license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
+aes-gcm = "0.11"
 bytes = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6.0"
+dns-lookup = "3.0"
 eframe = { version = "0.35", default-features = false, features = ["accesskit", "glow", "wayland", "x11"] }
 egui_extras = "0.35"
 flate2 = "1.1"
+futures-util = { version = "0.3", features = ["sink"] }
 hex = "0.4"
 http-body-util = "0.1"
 hudsucker = { version = "0.24.1", features = ["http2"] }
 parking_lot = "0.12"
+pbkdf2 = "0.12"
+prost-reflect = "0.16"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json"] }
 regex = "1.12"
@@ -25,6 +30,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 url = "2.5"
 uuid = { version = "1.18", features = ["v4", "serde"] }
 
@@ -34,6 +40,10 @@ windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinInet",
+  "Win32_Security_Cryptography",
+  "Win32_Security_WinTrust",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_UI_Input_KeyboardAndMouse",

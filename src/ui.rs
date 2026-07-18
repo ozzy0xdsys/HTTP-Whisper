@@ -1,4 +1,11 @@
-use std::{fs, sync::mpsc, thread, time::Duration};
+use std::{
+    fs,
+    future::Future,
+    path::PathBuf,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use chrono::{TimeDelta, Utc};
 use eframe::egui::{
@@ -9,17 +16,25 @@ use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
 
 use crate::{
+    baseline::TrafficBaseline,
+    capsule::{export_capsule, import_capsule},
     capture::CaptureWorker,
     config::{
-        AppPaths, AppSettings, AutoResponseRule, ResponseRewriteRule, TableColorField,
-        TableColorPreset, TableColorRule, TableColorTarget,
+        AppPaths, AppSettings, AutoResponseRule, ExfiltrationMode, ResponseRewriteRule,
+        TableColorField, TableColorPreset, TableColorRule, TableColorTarget,
     },
+    dossier::{HostDossierIndex, HostIntelligence, lookup_host_intelligence},
+    experiment,
     filtering::matches_filter,
+    investigation::{explain_session, process_timeline},
     model::{
-        CaptureEvent, CapturedExchange, CapturedRequest, CapturedResponse, Header, Session,
-        ThreatAssessment, ThreatLevel, WebSocketMessage, headers_as_text,
+        BehaviorAssessment, CaptureEvent, CapturedExchange, CapturedRequest, CapturedResponse,
+        GuardAction, GuardAssessment, Header, Session, ThreatAssessment, ThreatLevel,
+        WebSocketMessage, headers_as_text,
     },
-    platform,
+    platform::{self, BypassConnection, DnsObservation},
+    protocol::{ProtocolTracker, decode_with_descriptors, descriptor_messages, protocol_summary},
+    rule_debugger::{hit_counts, simulate},
     rules::pattern_matches,
     storage::SessionRepository,
     threat::ThreatAnalyzer,
@@ -48,19 +63,37 @@ enum DialogKind {
     AutoResponses,
     ResponseRewrites,
     Certificates,
+    Workbench,
     About,
+}
+
+enum BackgroundResult {
+    HostIntelligence {
+        host: String,
+        result: Box<Result<HostIntelligence, String>>,
+    },
+    WebSocketReplay {
+        result: Result<String, String>,
+    },
+    BypassSnapshot {
+        connections: Vec<BypassConnection>,
+        dns: Vec<DnsObservation>,
+    },
 }
 
 pub struct HttpWhisperApp {
     settings: AppSettings,
     settings_draft: AppSettings,
     hidden_hosts_draft: String,
+    guard_trusted_hosts_draft: String,
     auto_draft: Vec<AutoResponseRule>,
     auto_selected: usize,
     rewrite_draft: Vec<ResponseRewriteRule>,
     rewrite_selected: usize,
     events_tx: mpsc::Sender<CaptureEvent>,
     events_rx: mpsc::Receiver<CaptureEvent>,
+    background_tx: mpsc::Sender<BackgroundResult>,
+    background_rx: mpsc::Receiver<BackgroundResult>,
     repository: Option<SessionRepository>,
     worker: Option<CaptureWorker>,
     auto_connect_pending: bool,
@@ -77,6 +110,27 @@ pub struct HttpWhisperApp {
     status: String,
     errors: usize,
     threat_analyzer: ThreatAnalyzer,
+    baseline: TrafficBaseline,
+    dossiers: HostDossierIndex,
+    protocol_tracker: ProtocolTracker,
+    analysis_dirty: bool,
+    last_analysis_save: Instant,
+    bypass_connections: Vec<BypassConnection>,
+    dns_observations: Vec<DnsObservation>,
+    bypass_polling: bool,
+    last_bypass_poll: Instant,
+    last_dns_poll: Instant,
+    workbench_tab: usize,
+    dossier_selected: String,
+    capsule_path: String,
+    capsule_passphrase: String,
+    capsule_sanitize: bool,
+    experiment_before_start: Option<usize>,
+    experiment_before: Vec<Session>,
+    experiment_after_start: Option<usize>,
+    experiment_report: String,
+    descriptor_report: String,
+    rule_undo: Option<(Vec<AutoResponseRule>, Vec<ResponseRewriteRule>)>,
 }
 
 impl HttpWhisperApp {
@@ -85,14 +139,40 @@ impl HttpWhisperApp {
         let auto_connect_pending = settings.auto_connect;
         let startup_error = configure_startup(settings.start_with_windows).err();
         let hidden_hosts_draft = settings.hidden_hosts.join("\n");
+        let guard_trusted_hosts_draft = settings.exfiltration_trusted_hosts.join("\n");
         let (events_tx, events_rx) = mpsc::channel();
-        let repository = AppPaths::discover()
-            .ok()
+        let (background_tx, background_rx) = mpsc::channel();
+        let paths = AppPaths::discover().ok();
+        let repository = paths
+            .as_ref()
             .map(|paths| SessionRepository::new(paths.sessions_dir.join("sessions.db")))
             .and_then(|repository| repository.initialize().ok().map(|()| repository));
+        let baseline = paths
+            .as_ref()
+            .and_then(|paths| TrafficBaseline::load(&paths.baselines_file).ok())
+            .unwrap_or_default();
+        let dossiers = paths
+            .as_ref()
+            .and_then(|paths| HostDossierIndex::load(&paths.dossiers_file).ok())
+            .unwrap_or_default();
+        let dossier_selected = dossiers.hosts.keys().next().cloned().unwrap_or_default();
+        let capsule_path = paths
+            .as_ref()
+            .map(|paths| {
+                paths
+                    .capsules_dir
+                    .join(format!(
+                        "capture-{}.whispercapsule",
+                        Utc::now().format("%Y%m%d-%H%M%S")
+                    ))
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "capture.whispercapsule".into());
         Self {
             settings_draft: settings.clone(),
             hidden_hosts_draft,
+            guard_trusted_hosts_draft,
             auto_draft: settings.auto_response_rules.clone(),
             rewrite_draft: settings.response_rewrite_rules.clone(),
             settings,
@@ -100,6 +180,8 @@ impl HttpWhisperApp {
             rewrite_selected: 0,
             events_tx,
             events_rx,
+            background_tx,
+            background_rx,
             repository,
             worker: None,
             auto_connect_pending,
@@ -123,6 +205,31 @@ impl HttpWhisperApp {
             ),
             errors: 0,
             threat_analyzer: ThreatAnalyzer::default(),
+            baseline,
+            dossiers,
+            protocol_tracker: ProtocolTracker::default(),
+            analysis_dirty: false,
+            last_analysis_save: Instant::now(),
+            bypass_connections: Vec::new(),
+            dns_observations: Vec::new(),
+            bypass_polling: false,
+            last_bypass_poll: Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now),
+            last_dns_poll: Instant::now()
+                .checked_sub(Duration::from_secs(30))
+                .unwrap_or_else(Instant::now),
+            workbench_tab: 0,
+            dossier_selected,
+            capsule_path,
+            capsule_passphrase: String::new(),
+            capsule_sanitize: true,
+            experiment_before_start: None,
+            experiment_before: Vec::new(),
+            experiment_after_start: None,
+            experiment_report: String::new(),
+            descriptor_report: String::new(),
+            rule_undo: None,
         }
     }
 
@@ -159,6 +266,7 @@ impl HttpWhisperApp {
                         self.errors += 1;
                         self.status = format!("Could not save session: {error}");
                     }
+                    self.record_analysis(&Session::Http(exchange.clone()));
                     self.push_session(Session::Http(exchange));
                 }
                 CaptureEvent::ReplayCompleted(mut exchange) => {
@@ -182,12 +290,15 @@ impl HttpWhisperApp {
                         self.errors += 1;
                         self.status = format!("Could not save replay: {error}");
                     }
+                    self.record_analysis(&Session::Http(exchange.clone()));
                     self.push_session(Session::Http(exchange));
                 }
                 CaptureEvent::WebSocket(mut message) => {
+                    self.protocol_tracker.analyze(&mut message);
                     self.assess_websocket(&mut message);
                     self.activity =
                         format!("WebSocket {} {}", message.direction.label(), message.url);
+                    self.record_analysis(&Session::WebSocket(message.clone()));
                     self.push_session(Session::WebSocket(message));
                 }
                 CaptureEvent::Error(message) => {
@@ -216,6 +327,7 @@ impl HttpWhisperApp {
         {
             worker.join();
         }
+        self.poll_background_results();
     }
 
     fn start_capture(&mut self) {
@@ -226,6 +338,8 @@ impl HttpWhisperApp {
         self.selected = None;
         self.errors = 0;
         self.threat_analyzer.reset();
+        self.protocol_tracker.reset();
+        self.bypass_connections.clear();
         self.state = "Starting".into();
         self.ca_state = "Installing".into();
         self.status = "Starting native Rust capture".into();
@@ -257,30 +371,291 @@ impl HttpWhisperApp {
     fn assess_http(&mut self, exchange: &mut CapturedExchange) {
         if !self.settings.threat_detection_enabled {
             exchange.threat = ThreatAssessment::default();
-            return;
+        } else {
+            let threshold = Duration::from_secs(self.settings.idle_warning_minutes * 60);
+            exchange.threat =
+                self.threat_analyzer
+                    .analyze_http(exchange, platform::idle_duration(), threshold);
         }
-        let threshold = Duration::from_secs(self.settings.idle_warning_minutes * 60);
-        exchange.threat =
-            self.threat_analyzer
-                .analyze_http(exchange, platform::idle_duration(), threshold);
+        exchange.behavior = self
+            .baseline
+            .assess_http(exchange, self.settings.baseline_learning_enabled);
+        add_context_findings(
+            &mut exchange.threat,
+            &exchange.behavior,
+            &exchange.request.guard,
+            exchange.request.provenance.signature_valid,
+            &exchange.request.process,
+        );
         self.announce_threat(&exchange.threat);
     }
 
     fn assess_websocket(&mut self, message: &mut WebSocketMessage) {
         if !self.settings.threat_detection_enabled {
             message.threat = ThreatAssessment::default();
-            return;
+        } else {
+            let threshold = Duration::from_secs(self.settings.idle_warning_minutes * 60);
+            message.threat = self.threat_analyzer.analyze_websocket(
+                message,
+                platform::idle_duration(),
+                threshold,
+            );
         }
-        let threshold = Duration::from_secs(self.settings.idle_warning_minutes * 60);
-        message.threat =
-            self.threat_analyzer
-                .analyze_websocket(message, platform::idle_duration(), threshold);
+        message.behavior = self
+            .baseline
+            .assess_websocket(message, self.settings.baseline_learning_enabled);
+        add_context_findings(
+            &mut message.threat,
+            &message.behavior,
+            &message.guard,
+            message.provenance.signature_valid,
+            &message.process,
+        );
         self.announce_threat(&message.threat);
     }
 
     fn announce_threat(&mut self, threat: &ThreatAssessment) {
         if let Some(finding) = threat.primary_finding().filter(|_| threat.is_warning()) {
             self.status = format!("Warning: {} - {}", finding.title, finding.evidence);
+        }
+    }
+
+    fn record_analysis(&mut self, session: &Session) {
+        if self.settings.baseline_learning_enabled {
+            self.baseline.observe(session);
+        }
+        self.dossiers.observe(session);
+        if self.dossier_selected.is_empty() {
+            self.dossier_selected = session.host().to_ascii_lowercase();
+        }
+        self.analysis_dirty = true;
+    }
+
+    fn persist_analysis_state(&mut self, force: bool) {
+        if !self.analysis_dirty
+            || (!force && self.last_analysis_save.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        let result = AppPaths::discover().and_then(|paths| {
+            paths.ensure()?;
+            self.baseline.save(&paths.baselines_file)?;
+            self.dossiers.save(&paths.dossiers_file)
+        });
+        match result {
+            Ok(()) => {
+                self.analysis_dirty = false;
+                self.last_analysis_save = Instant::now();
+            }
+            Err(error) => {
+                self.errors += 1;
+                self.status = format!("Could not save investigation data: {error}");
+            }
+        }
+    }
+
+    fn poll_background_results(&mut self) {
+        while let Ok(event) = self.background_rx.try_recv() {
+            match event {
+                BackgroundResult::HostIntelligence { host, result } => match *result {
+                    Ok(intelligence) => {
+                        self.dossiers.set_intelligence(&host, intelligence);
+                        self.analysis_dirty = true;
+                        self.status = format!("Host intelligence refreshed for {host}");
+                    }
+                    Err(error) => {
+                        self.errors += 1;
+                        self.status = format!("Host intelligence failed for {host}: {error}");
+                    }
+                },
+                BackgroundResult::WebSocketReplay { result } => match result {
+                    Ok(message) => self.status = message,
+                    Err(error) => {
+                        self.errors += 1;
+                        self.status = format!("WebSocket replay failed: {error}");
+                    }
+                },
+                BackgroundResult::BypassSnapshot { connections, dns } => {
+                    self.bypass_polling = false;
+                    self.merge_bypass_snapshot(connections, dns);
+                }
+            }
+        }
+    }
+
+    fn poll_bypass_connections(&mut self, force: bool) {
+        if !self.settings.bypass_radar_enabled
+            || self.bypass_polling
+            || (!force && self.last_bypass_poll.elapsed() < Duration::from_secs(2))
+        {
+            return;
+        }
+        self.last_bypass_poll = Instant::now();
+        let poll_dns = force || self.last_dns_poll.elapsed() >= Duration::from_secs(15);
+        if poll_dns {
+            self.last_dns_poll = Instant::now();
+        }
+        self.bypass_polling = true;
+        let port = self.settings.capture_port;
+        let events = self.background_tx.clone();
+        spawn_background("http-whisper-bypass-radar", move || async move {
+            let connections = platform::snapshot_bypass_connections(port);
+            let dns = if poll_dns {
+                platform::snapshot_dns_cache()
+            } else {
+                Vec::new()
+            };
+            let _ = events.send(BackgroundResult::BypassSnapshot { connections, dns });
+        });
+    }
+
+    fn merge_bypass_snapshot(
+        &mut self,
+        snapshots: Vec<BypassConnection>,
+        dns: Vec<DnsObservation>,
+    ) {
+        for snapshot in snapshots {
+            let key = (
+                snapshot.pid,
+                snapshot.local_addr.clone(),
+                snapshot.remote_addr.clone(),
+                snapshot.remote_port,
+            );
+            if let Some(existing) = self.bypass_connections.iter_mut().find(|existing| {
+                (
+                    existing.pid,
+                    existing.local_addr.clone(),
+                    existing.remote_addr.clone(),
+                    existing.remote_port,
+                ) == key
+            }) {
+                existing.last_seen = snapshot.last_seen;
+                existing.observations = existing.observations.saturating_add(1);
+            } else {
+                self.bypass_connections.push(snapshot.clone());
+            }
+            self.dossiers.observe_bypass(&snapshot);
+            self.analysis_dirty = true;
+        }
+        let cutoff = Utc::now() - TimeDelta::minutes(30);
+        self.bypass_connections
+            .retain(|connection| connection.last_seen >= cutoff);
+        if self.bypass_connections.len() > 5_000 {
+            self.bypass_connections
+                .sort_by_key(|connection| connection.last_seen);
+            self.bypass_connections
+                .drain(..self.bypass_connections.len() - 5_000);
+        }
+        for observation in dns {
+            if let Some(existing) = self.dns_observations.iter_mut().find(|existing| {
+                existing.host.eq_ignore_ascii_case(&observation.host)
+                    && existing.address == observation.address
+            }) {
+                existing.observed_at = observation.observed_at;
+            } else {
+                self.dns_observations.push(observation);
+            }
+        }
+        self.dns_observations
+            .retain(|observation| observation.observed_at >= cutoff);
+        if self.dns_observations.len() > 5_000 {
+            self.dns_observations
+                .sort_by_key(|observation| observation.observed_at);
+            self.dns_observations
+                .drain(..self.dns_observations.len() - 5_000);
+        }
+    }
+
+    fn refresh_selected_host_intelligence(&mut self) {
+        if !self.settings.host_intelligence_enabled {
+            self.status = "Enable public host intelligence in Settings first".into();
+            return;
+        }
+        let host = self.dossier_selected.clone();
+        if host.is_empty() {
+            self.status = "Select a host dossier to refresh".into();
+            return;
+        }
+        let events = self.background_tx.clone();
+        self.status = format!("Refreshing public intelligence for {host}");
+        spawn_background("http-whisper-host-intel", move || async move {
+            let result = lookup_host_intelligence(&host)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = events.send(BackgroundResult::HostIntelligence {
+                host,
+                result: Box::new(result),
+            });
+        });
+    }
+
+    fn replay_selected_websocket(&mut self) {
+        let Some(Session::WebSocket(message)) = self.selected_session().cloned() else {
+            self.status = "Select a WebSocket message to replay".into();
+            return;
+        };
+        let events = self.background_tx.clone();
+        self.status = format!("Replaying WebSocket message #{}", message.sequence);
+        spawn_background("http-whisper-ws-replay", move || async move {
+            let result = crate::websocket_replay::replay(&message)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = events.send(BackgroundResult::WebSocketReplay { result });
+        });
+    }
+
+    fn export_current_capsule(&mut self) {
+        let path = PathBuf::from(self.capsule_path.trim());
+        match export_capsule(
+            &path,
+            &self.sessions,
+            &self.settings,
+            &self.baseline,
+            &self.dossiers,
+            self.capsule_sanitize,
+            &self.capsule_passphrase,
+        ) {
+            Ok(()) => self.status = format!("Capture capsule saved to {}", path.display()),
+            Err(error) => {
+                self.errors += 1;
+                self.status = format!("Could not export capsule: {error}");
+            }
+        }
+    }
+
+    fn open_capsule(&mut self) {
+        let path = PathBuf::from(self.capsule_path.trim());
+        match import_capsule(&path, &self.capsule_passphrase) {
+            Ok(capsule) => {
+                self.sessions = capsule.sessions;
+                self.settings.auto_response_rules = capsule.rules.auto_responses;
+                self.settings.response_rewrite_rules = capsule.rules.response_rewrites;
+                self.baseline = capsule.baseline;
+                self.dossiers = capsule.dossiers;
+                self.selected = self.sessions.first().map(Session::id);
+                self.dossier_selected = self
+                    .dossiers
+                    .hosts
+                    .keys()
+                    .next()
+                    .cloned()
+                    .unwrap_or_default();
+                self.analysis_dirty = true;
+                self.persist_analysis_state(true);
+                if let Err(error) = self.settings.save() {
+                    self.errors += 1;
+                    self.status = format!("Capsule opened, but rules could not be saved: {error}");
+                } else {
+                    if let Some(worker) = &self.worker {
+                        worker.update_settings(self.settings.clone());
+                    }
+                    self.status = format!("Opened capsule with {} session(s)", self.sessions.len());
+                }
+            }
+            Err(error) => {
+                self.errors += 1;
+                self.status = format!("Could not open capsule: {error}");
+            }
         }
     }
 
@@ -298,6 +673,8 @@ impl HttpWhisperApp {
             DialogKind::Settings => {
                 self.settings_draft = self.settings.clone();
                 self.hidden_hosts_draft = self.settings.hidden_hosts.join("\n");
+                self.guard_trusted_hosts_draft =
+                    self.settings.exfiltration_trusted_hosts.join("\n");
                 self.table_color_selected = self.table_color_selected.min(
                     self.settings_draft
                         .table_color_rules
@@ -325,6 +702,7 @@ impl HttpWhisperApp {
     fn save_settings(&mut self) {
         let mut settings = self.settings_draft.clone();
         settings.hidden_hosts = parse_hidden_hosts(&self.hidden_hosts_draft);
+        settings.exfiltration_trusted_hosts = parse_hidden_hosts(&self.guard_trusted_hosts_draft);
         match settings.save() {
             Ok(()) => {
                 self.settings = settings;
@@ -352,12 +730,20 @@ impl HttpWhisperApp {
     }
 
     fn save_auto_rules(&mut self) {
+        self.rule_undo = Some((
+            self.settings.auto_response_rules.clone(),
+            self.settings.response_rewrite_rules.clone(),
+        ));
         self.settings.auto_response_rules = self.auto_draft.clone();
         let count = self.auto_draft.iter().filter(|rule| rule.enabled).count();
         self.persist_settings(&format!("{count} auto response rule(s) enabled"));
     }
 
     fn save_rewrite_rules(&mut self) {
+        self.rule_undo = Some((
+            self.settings.auto_response_rules.clone(),
+            self.settings.response_rewrite_rules.clone(),
+        ));
         self.settings.response_rewrite_rules = self.rewrite_draft.clone();
         let count = self.rewrite_draft.len();
         self.persist_settings(&format!("{count} response rewrite rule(s) enabled"));
@@ -372,6 +758,21 @@ impl HttpWhisperApp {
                 self.activity = message.into();
                 self.status = "Settings saved".into();
                 self.dialog = None;
+            }
+            Err(error) => {
+                self.errors += 1;
+                self.status = error.to_string();
+            }
+        }
+    }
+
+    fn save_runtime_settings(&mut self, message: &str) {
+        match self.settings.save() {
+            Ok(()) => {
+                if let Some(worker) = &self.worker {
+                    worker.update_settings(self.settings.clone());
+                }
+                self.status = message.into();
             }
             Err(error) => {
                 self.errors += 1;
@@ -461,6 +862,11 @@ impl HttpWhisperApp {
                         }
                     });
                     ui.menu_button("Tools", |ui| {
+                        if ui.button("Investigation Workbench...").clicked() {
+                            self.open_dialog(DialogKind::Workbench);
+                            ui.close();
+                        }
+                        ui.separator();
                         if ui.button("Auto Responses...").clicked() {
                             self.open_dialog(DialogKind::AutoResponses);
                             ui.close();
@@ -504,6 +910,9 @@ impl HttpWhisperApp {
                     }
                     if ui.add(toolbar_button("Replay")).clicked() {
                         self.replay_selected();
+                    }
+                    if ui.add(toolbar_button("Workbench")).clicked() {
+                        self.open_dialog(DialogKind::Workbench);
                     }
                     if ui.add(toolbar_button("Auto Responses")).clicked() {
                         self.open_dialog(DialogKind::AutoResponses);
@@ -701,7 +1110,7 @@ impl HttpWhisperApp {
 
     fn inspector(&mut self, ui: &mut Ui) {
         let tabs = [
-            "Overview", "Warnings", "Request", "Response", "Headers", "Raw", "Notes",
+            "Overview", "Warnings", "Report", "Request", "Response", "Headers", "Raw", "Notes",
         ];
         Frame::new()
             .fill(XP_BG)
@@ -736,7 +1145,10 @@ impl HttpWhisperApp {
         if self.tab == 1 {
             return threat_inspector(session.threat());
         }
-        let content_tab = if self.tab > 1 { self.tab - 1 } else { self.tab };
+        if self.tab == 2 {
+            return explain_session(session, &self.dossiers);
+        }
+        let content_tab = if self.tab > 2 { self.tab - 2 } else { self.tab };
         match session {
             Session::Http(exchange) => http_inspector(exchange, content_tab),
             Session::WebSocket(message) => websocket_inspector(message, content_tab),
@@ -760,6 +1172,7 @@ impl HttpWhisperApp {
             DialogKind::AutoResponses => self.auto_responses_dialog(ui),
             DialogKind::ResponseRewrites => self.response_rewrites_dialog(ui),
             DialogKind::Certificates => self.certificates_dialog(ui),
+            DialogKind::Workbench => self.workbench_dialog(ui),
             DialogKind::About => self.about_dialog(ui),
         }
     }
@@ -768,22 +1181,24 @@ impl HttpWhisperApp {
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
-            .fixed_size([460.0, 250.0])
+            .fixed_size([520.0, 330.0])
             .show(ui.ctx(), |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.settings_tab, 0, "General");
                     ui.selectable_value(&mut self.settings_tab, 1, "Warnings");
-                    ui.selectable_value(&mut self.settings_tab, 2, "Colors");
+                    ui.selectable_value(&mut self.settings_tab, 2, "Data Guard");
+                    ui.selectable_value(&mut self.settings_tab, 3, "Colors");
                 });
                 ui.separator();
                 ScrollArea::vertical()
                     .id_salt("settings-page")
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .max_height(150.0)
+                    .max_height(230.0)
                     .show(ui, |ui| match self.settings_tab {
                         0 => self.settings_general_tab(ui),
                         1 => self.settings_warnings_tab(ui),
+                        2 => self.settings_guard_tab(ui),
                         _ => self.settings_colors_tab(ui),
                     });
                 ui.add_space(4.0);
@@ -875,7 +1290,61 @@ impl HttpWhisperApp {
                         .suffix(" min"),
                 );
                 ui.end_row();
+                ui.label("Learn Normal");
+                ui.checkbox(
+                    &mut self.settings_draft.baseline_learning_enabled,
+                    "Add trusted traffic to baseline",
+                );
+                ui.end_row();
+                ui.label("Bypass radar");
+                ui.add_enabled(
+                    cfg!(windows),
+                    egui::Checkbox::new(
+                        &mut self.settings_draft.bypass_radar_enabled,
+                        if cfg!(windows) {
+                            "Observe direct outbound TCP"
+                        } else {
+                            "Windows only"
+                        },
+                    ),
+                );
+                ui.end_row();
+                ui.label("Host intelligence");
+                ui.checkbox(
+                    &mut self.settings_draft.host_intelligence_enabled,
+                    "Allow public DNS and RDAP lookup",
+                );
+                ui.end_row();
             });
+    }
+
+    fn settings_guard_tab(&mut self, ui: &mut Ui) {
+        egui::Grid::new("settings-guard-grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Outbound secrets");
+                egui::ComboBox::from_id_salt("exfiltration-guard-mode")
+                    .selected_text(self.settings_draft.exfiltration_guard_mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in ExfiltrationMode::ALL {
+                            ui.selectable_value(
+                                &mut self.settings_draft.exfiltration_guard_mode,
+                                mode,
+                                mode.label(),
+                            );
+                        }
+                    });
+                ui.end_row();
+            });
+        ui.separator();
+        ui.label("Trusted destinations (one per line)");
+        scrollable_text_editor(
+            ui,
+            "guard-trusted-hosts",
+            &mut self.guard_trusted_hosts_draft,
+            120.0,
+        );
     }
 
     fn settings_colors_tab(&mut self, ui: &mut Ui) {
@@ -1002,6 +1471,515 @@ impl HttpWhisperApp {
         if changed {
             self.settings_draft.table_color_preset = TableColorPreset::Custom;
         }
+    }
+
+    fn workbench_dialog(&mut self, ui: &mut Ui) {
+        let screen = ui.ctx().content_rect().size();
+        let (default_size, minimum_size) = workbench_window_sizes(screen);
+        egui::Window::new("Investigation Workbench")
+            .collapsible(false)
+            .resizable(true)
+            .default_size(default_size)
+            .min_size(minimum_size)
+            .show(ui.ctx(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (index, label) in [
+                        "Timeline",
+                        "Baseline",
+                        "Bypass",
+                        "WebSockets",
+                        "Dossiers",
+                        "Capsules",
+                        "Experiments",
+                        "Rules",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        ui.selectable_value(&mut self.workbench_tab, index, *label);
+                    }
+                });
+                ui.separator();
+                let content_height = (ui.available_height() - 38.0).max(320.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), content_height),
+                    Layout::top_down(Align::Min),
+                    |ui| match self.workbench_tab {
+                        0 => self.workbench_timeline(ui),
+                        1 => self.workbench_baseline(ui),
+                        2 => self.workbench_bypass(ui),
+                        3 => self.workbench_websockets(ui),
+                        4 => self.workbench_dossiers(ui),
+                        5 => self.workbench_capsules(ui),
+                        6 => self.workbench_experiments(ui),
+                        _ => self.workbench_rules(ui),
+                    },
+                );
+                ui.separator();
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        self.dialog = None;
+                    }
+                });
+            });
+    }
+
+    fn workbench_timeline(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Copy Timeline").clicked() {
+                ui.ctx().copy_text(process_timeline(&self.sessions));
+                self.status = "Application timeline copied".into();
+            }
+            ui.label(format!("{} captured event(s)", self.sessions.len()));
+        });
+        let report = process_timeline(&self.sessions);
+        read_only_text(ui, "workbench-timeline", &report, ui.available_height());
+    }
+
+    fn workbench_baseline(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            let changed = ui
+                .checkbox(&mut self.settings.baseline_learning_enabled, "Learn Normal")
+                .changed();
+            if changed {
+                self.save_runtime_settings(if self.settings.baseline_learning_enabled {
+                    "Learn Normal enabled"
+                } else {
+                    "Learn Normal stopped"
+                });
+            }
+            if ui.button("Clear Baseline").clicked() {
+                self.baseline.clear();
+                self.analysis_dirty = true;
+                self.persist_analysis_state(true);
+                self.status = "Learned traffic baseline cleared".into();
+            }
+            if ui.button("Save Now").clicked() {
+                self.analysis_dirty = true;
+                self.persist_analysis_state(true);
+                self.status = "Traffic baseline saved".into();
+            }
+        });
+        ui.label(format!(
+            "Processes: {}    Process/host pairs: {}    State: {}",
+            self.baseline.process_count(),
+            self.baseline.host_count(),
+            if self.settings.baseline_learning_enabled {
+                "Learning"
+            } else {
+                "Monitoring"
+            }
+        ));
+        let summary = self.baseline.summary();
+        read_only_text(ui, "workbench-baseline", &summary, ui.available_height());
+    }
+
+    fn workbench_bypass(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            let changed = ui
+                .add_enabled(
+                    cfg!(windows),
+                    egui::Checkbox::new(&mut self.settings.bypass_radar_enabled, "Bypass Radar"),
+                )
+                .changed();
+            if changed {
+                self.save_runtime_settings("Bypass radar setting saved");
+            }
+            if ui.button("Refresh").clicked() {
+                self.poll_bypass_connections(true);
+            }
+            if ui.button("Clear").clicked() {
+                self.bypass_connections.clear();
+                self.dns_observations.clear();
+            }
+            ui.label(format!(
+                "{} direct connection(s), {} DNS record(s)",
+                self.bypass_connections.len(),
+                self.dns_observations.len()
+            ));
+        });
+        ui.label(if cfg!(windows) {
+            "Coverage: Windows IPv4 established TCP and DNS client cache"
+        } else {
+            "Bypass Radar is currently available on Windows only"
+        });
+        ui.separator();
+        ScrollArea::both().id_salt("bypass-table").show(ui, |ui| {
+            egui::Grid::new("bypass-grid")
+                .striped(true)
+                .min_col_width(90.0)
+                .show(ui, |ui| {
+                    for heading in [
+                        "Process",
+                        "PID",
+                        "Local",
+                        "Remote",
+                        "Port",
+                        "First Seen",
+                        "Last Seen",
+                        "Samples",
+                    ] {
+                        ui.strong(heading);
+                    }
+                    ui.end_row();
+                    let mut rows = self.bypass_connections.clone();
+                    rows.sort_by(|left, right| right.last_seen.cmp(&left.last_seen));
+                    for connection in rows {
+                        ui.label(if connection.process.is_empty() {
+                            "<unknown>"
+                        } else {
+                            &connection.process
+                        });
+                        ui.label(connection.pid.to_string());
+                        ui.label(connection.local_addr);
+                        let dns_names = self
+                            .dns_observations
+                            .iter()
+                            .filter(|value| value.address == connection.remote_addr)
+                            .map(|value| value.host.as_str())
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        ui.label(if dns_names.is_empty() {
+                            connection.remote_addr
+                        } else {
+                            format!("{} ({dns_names})", connection.remote_addr)
+                        });
+                        ui.label(connection.remote_port.to_string());
+                        ui.label(connection.first_seen.format("%H:%M:%S").to_string());
+                        ui.label(connection.last_seen.format("%H:%M:%S").to_string());
+                        ui.label(connection.observations.to_string());
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(10.0);
+            ui.strong("DNS observations");
+            egui::Grid::new("bypass-dns-grid")
+                .striped(true)
+                .min_col_width(150.0)
+                .show(ui, |ui| {
+                    ui.strong("Host");
+                    ui.strong("Address");
+                    ui.strong("Observed");
+                    ui.end_row();
+                    let mut rows = self.dns_observations.clone();
+                    rows.sort_by(|left, right| right.observed_at.cmp(&left.observed_at));
+                    for observation in rows.into_iter().take(1_000) {
+                        ui.label(observation.host);
+                        ui.label(observation.address);
+                        ui.label(observation.observed_at.format("%H:%M:%S").to_string());
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn workbench_websockets(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Replay Selected Message").clicked() {
+                self.replay_selected_websocket();
+            }
+            ui.label("Descriptor set");
+            ui.add_sized(
+                [280.0, 22.0],
+                TextEdit::singleline(&mut self.settings.protobuf_descriptor_file),
+            );
+            if ui.button("Load").clicked() {
+                let path = PathBuf::from(self.settings.protobuf_descriptor_file.trim());
+                match descriptor_messages(&path) {
+                    Ok(messages) => {
+                        let mut report = format!(
+                            "Loaded {} protobuf message descriptor(s)\n{}",
+                            messages.len(),
+                            messages.join("\n")
+                        );
+                        if let Some(Session::WebSocket(message)) = self.selected_session()
+                            && !message.wire_payload.is_empty()
+                        {
+                            match decode_with_descriptors(&path, &message.wire_payload) {
+                                Ok(candidates) if !candidates.is_empty() => {
+                                    report.push_str("\n\nSelected binary decode candidates\n");
+                                    report.push_str(&candidates.join("\n\n"));
+                                }
+                                Ok(_) => report.push_str(
+                                    "\n\nNo descriptor decoded the selected message with known fields.",
+                                ),
+                                Err(error) => {
+                                    report.push_str(&format!("\n\nDecode failed: {error}"));
+                                }
+                            }
+                        }
+                        self.descriptor_report = report;
+                        self.save_runtime_settings("Protobuf descriptor set loaded");
+                    }
+                    Err(error) => {
+                        self.errors += 1;
+                        self.descriptor_report = error.to_string();
+                    }
+                }
+            }
+        });
+        let messages = self
+            .sessions
+            .iter()
+            .filter_map(|session| match session {
+                Session::WebSocket(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut summary = protocol_summary(&messages);
+        if let Some(Session::WebSocket(message)) = self.selected_session() {
+            summary.push_str(&format!(
+                "\n\nSelected message #{}\nProtocol: {}\nType: {}\nCorrelation: {}\nSequence value: {}\nReply to capture: {}\nGuard: {}\n\nSchema\n{}",
+                message.sequence,
+                value_or_unknown(&message.analysis.protocol),
+                value_or_unknown(&message.analysis.message_type),
+                value_or_unknown(&message.analysis.correlation_id),
+                message.analysis.sequence_value.map(|value| value.to_string()).unwrap_or_else(|| "<none>".into()),
+                message.analysis.reply_to_sequence.map(|value| value.to_string()).unwrap_or_else(|| "<none>".into()),
+                message.guard.action.label(),
+                message.analysis.schema.join("\n")
+            ));
+        }
+        if !self.descriptor_report.is_empty() {
+            summary.push_str("\n\nProtobuf descriptors\n");
+            summary.push_str(&self.descriptor_report);
+        }
+        read_only_text(ui, "workbench-websocket", &summary, ui.available_height());
+    }
+
+    fn workbench_dossiers(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Host");
+            let hosts = self.dossiers.hosts.keys().cloned().collect::<Vec<_>>();
+            egui::ComboBox::from_id_salt("dossier-host")
+                .selected_text(value_or_unknown(&self.dossier_selected))
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for host in hosts {
+                        ui.selectable_value(&mut self.dossier_selected, host.clone(), host);
+                    }
+                });
+            if ui.button("Refresh Intelligence").clicked() {
+                self.refresh_selected_host_intelligence();
+            }
+            let changed = ui
+                .checkbox(
+                    &mut self.settings.host_intelligence_enabled,
+                    "Public DNS/RDAP",
+                )
+                .changed();
+            if changed {
+                self.save_runtime_settings("Host intelligence setting saved");
+            }
+        });
+        let report = self.dossiers.report(&self.dossier_selected);
+        read_only_text(ui, "workbench-dossier", &report, ui.available_height());
+    }
+
+    fn workbench_capsules(&mut self, ui: &mut Ui) {
+        egui::Grid::new("capsule-controls")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Capsule file");
+                ui.add(TextEdit::singleline(&mut self.capsule_path).desired_width(600.0));
+                ui.end_row();
+                ui.label("Passphrase");
+                ui.add(
+                    TextEdit::singleline(&mut self.capsule_passphrase)
+                        .password(true)
+                        .desired_width(320.0),
+                );
+                ui.end_row();
+                ui.label("Sanitization");
+                ui.checkbox(
+                    &mut self.capsule_sanitize,
+                    "Redact secrets and raw WS bytes",
+                );
+                ui.end_row();
+            });
+        ui.horizontal(|ui| {
+            if ui.button("Export Capture Capsule").clicked() {
+                self.export_current_capsule();
+            }
+            if ui.button("Open Capture Capsule").clicked() {
+                self.open_capsule();
+            }
+        });
+        ui.separator();
+        let encryption = if self.capsule_passphrase.is_empty() {
+            "None"
+        } else {
+            "AES-256-GCM with PBKDF2-HMAC-SHA256"
+        };
+        let summary = format!(
+            "Sessions: {}\nAuto-response rules: {}\nResponse-rewrite rules: {}\nBaseline processes: {}\nHost dossiers: {}\nEncryption: {}\nSanitized: {}",
+            self.sessions.len(),
+            self.settings.auto_response_rules.len(),
+            self.settings.response_rewrite_rules.len(),
+            self.baseline.process_count(),
+            self.dossiers.hosts.len(),
+            encryption,
+            self.capsule_sanitize
+        );
+        read_only_text(ui, "workbench-capsule", &summary, 180.0);
+    }
+
+    fn workbench_experiments(&mut self, ui: &mut Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Start Before Window").clicked() {
+                self.experiment_before_start = Some(self.sessions.len());
+                self.experiment_before.clear();
+                self.experiment_report.clear();
+                self.status = "Before experiment window started".into();
+            }
+            if ui
+                .add_enabled(
+                    self.experiment_before_start.is_some(),
+                    egui::Button::new("End Before Window"),
+                )
+                .clicked()
+            {
+                let start = self.experiment_before_start.take().unwrap_or_default();
+                self.experiment_before = self.sessions[start.min(self.sessions.len())..].to_vec();
+                self.status = format!(
+                    "Before window saved with {} event(s)",
+                    self.experiment_before.len()
+                );
+            }
+            if ui
+                .add_enabled(
+                    !self.experiment_before.is_empty(),
+                    egui::Button::new("Start After Window"),
+                )
+                .clicked()
+            {
+                self.experiment_after_start = Some(self.sessions.len());
+                self.status = "After experiment window started".into();
+            }
+            if ui
+                .add_enabled(
+                    self.experiment_after_start.is_some(),
+                    egui::Button::new("End and Compare"),
+                )
+                .clicked()
+            {
+                let start = self.experiment_after_start.take().unwrap_or_default();
+                let after = &self.sessions[start.min(self.sessions.len())..];
+                self.experiment_report =
+                    experiment::compare(&self.experiment_before, after).render();
+                self.status = "Before/after comparison completed".into();
+            }
+            if ui.button("Reset").clicked() {
+                self.experiment_before_start = None;
+                self.experiment_before.clear();
+                self.experiment_after_start = None;
+                self.experiment_report.clear();
+            }
+        });
+        ui.label(format!(
+            "Before: {} event(s)    Before active: {}    After active: {}",
+            self.experiment_before.len(),
+            self.experiment_before_start.is_some(),
+            self.experiment_after_start.is_some()
+        ));
+        let report = if self.experiment_report.is_empty() {
+            "No experiment comparison has been generated."
+        } else {
+            &self.experiment_report
+        };
+        read_only_text(ui, "workbench-experiment", report, ui.available_height());
+    }
+
+    fn workbench_rules(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Auto Responses...").clicked() {
+                self.open_dialog(DialogKind::AutoResponses);
+            }
+            if ui.button("Response Rewrites...").clicked() {
+                self.open_dialog(DialogKind::ResponseRewrites);
+            }
+            if ui
+                .add_enabled(
+                    self.rule_undo.is_some(),
+                    egui::Button::new("Undo Rule Changes"),
+                )
+                .clicked()
+                && let Some((auto, rewrites)) = self.rule_undo.take()
+            {
+                self.settings.auto_response_rules = auto;
+                self.settings.response_rewrite_rules = rewrites;
+                self.save_runtime_settings("Last rule change undone");
+            }
+        });
+        let Some(session) = self.selected_session() else {
+            ui.label("Select an HTTP or WebSocket session to simulate rules.");
+            return;
+        };
+        let simulations = simulate(session, &self.settings);
+        let hits = hit_counts(&self.sessions);
+        if simulations.is_empty() {
+            ui.label("No auto-response or response-rewrite rules are configured.");
+            return;
+        }
+        ScrollArea::vertical()
+            .id_salt("workbench-rule-debugger")
+            .show(ui, |ui| {
+                for (index, simulation) in simulations.iter().enumerate() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&simulation.name).strong());
+                        ui.label(format!("[{}]", simulation.kind));
+                        ui.label(
+                            RichText::new(if simulation.matched {
+                                "MATCH"
+                            } else {
+                                "NO MATCH"
+                            })
+                            .strong()
+                            .color(if simulation.matched {
+                                Color32::from_rgb(0, 110, 0)
+                            } else {
+                                Color32::from_rgb(110, 110, 110)
+                            }),
+                        );
+                        ui.label(format!(
+                            "Historical hits: {}",
+                            hits.get(&simulation.name).copied().unwrap_or_default()
+                        ));
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        for condition in &simulation.conditions {
+                            let passed = condition.starts_with("PASS");
+                            ui.label(RichText::new(condition).color(if passed {
+                                Color32::from_rgb(0, 100, 0)
+                            } else {
+                                XP_DANGER
+                            }));
+                        }
+                    });
+                    if !simulation.effect.is_empty() {
+                        ui.label(format!("Effect: {}", simulation.effect));
+                    }
+                    if !simulation.preview.is_empty() {
+                        let mut preview = simulation.preview.clone();
+                        ScrollArea::both()
+                            .id_salt(("rule-preview", index))
+                            .max_height(130.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add_sized(
+                                    [ui.available_width(), 125.0],
+                                    TextEdit::multiline(&mut preview)
+                                        .font(FontId::monospace(12.0))
+                                        .desired_width(f32::INFINITY)
+                                        .interactive(false),
+                                );
+                            });
+                    }
+                    ui.separator();
+                }
+            });
     }
 
     fn auto_responses_dialog(&mut self, ui: &mut Ui) {
@@ -1228,7 +2206,7 @@ impl HttpWhisperApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     ui.heading("HTTP Whisper");
-                    ui.label("Version 0.7.3");
+                    ui.label("Version 0.8.0");
                     ui.add_space(8.0);
                     ui.label("Native Rust HTTP/HTTPS and WebSocket debugging workbench");
                     ui.label("Classic Windows XP interface");
@@ -1247,8 +2225,12 @@ impl eframe::App for HttpWhisperApp {
             self.start_capture();
         }
         self.poll_events();
+        self.poll_bypass_connections(false);
+        self.persist_analysis_state(false);
         if self.worker.as_ref().is_some_and(CaptureWorker::is_running) {
             ctx.request_repaint_after(Duration::from_millis(50));
+        } else if self.settings.bypass_radar_enabled {
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
 
@@ -1306,6 +2288,7 @@ impl eframe::App for HttpWhisperApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_analysis_state(true);
         if let Some(mut worker) = self.worker.take() {
             worker.join();
         }
@@ -1314,6 +2297,101 @@ impl eframe::App for HttpWhisperApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         XP_BG.to_normalized_gamma_f32()
     }
+}
+
+fn add_context_findings(
+    threat: &mut ThreatAssessment,
+    behavior: &BehaviorAssessment,
+    guard: &GuardAssessment,
+    signature_valid: Option<bool>,
+    process: &str,
+) {
+    if behavior.is_unusual() {
+        threat.add_finding(
+            30,
+            "Learned application behavior changed",
+            behavior
+                .changes
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
+    if !guard.findings.is_empty() {
+        let score = match guard.action {
+            GuardAction::None => 0,
+            GuardAction::Warned => 20,
+            GuardAction::Redacted => 35,
+            GuardAction::Blocked => 50,
+        };
+        if score > 0 {
+            threat.add_finding(
+                score,
+                format!("Exfiltration guard {} outbound data", guard.action.label()),
+                guard
+                    .findings
+                    .iter()
+                    .map(|finding| format!("{} at {}", finding.category, finding.location))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+        }
+    }
+    if signature_valid == Some(false) && !process.is_empty() {
+        threat.add_finding(
+            12,
+            "Executable signature is missing or invalid",
+            format!("{process} did not pass local Authenticode verification"),
+        );
+    }
+}
+
+fn spawn_background<F, Fut>(name: &'static str, task: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let _ = thread::Builder::new().name(name.into()).spawn(move || {
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            runtime.block_on(task());
+        }
+    });
+}
+
+fn read_only_text(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    text: &str,
+    height: f32,
+) {
+    let mut value = text.to_owned();
+    ScrollArea::both().id_salt(id).show(ui, |ui| {
+        ui.add_sized(
+            [ui.available_width(), height.max(100.0)],
+            TextEdit::multiline(&mut value)
+                .font(FontId::monospace(12.0))
+                .desired_width(f32::INFINITY)
+                .interactive(false),
+        );
+    });
+}
+
+fn value_or_unknown(value: &str) -> &str {
+    if value.is_empty() { "<unknown>" } else { value }
+}
+
+fn workbench_window_sizes(screen: Vec2) -> (Vec2, Vec2) {
+    let default_size = Vec2::new(
+        (screen.x - 32.0).clamp(620.0, 980.0),
+        (screen.y - 72.0).clamp(360.0, 620.0),
+    );
+    let minimum_size = Vec2::new(default_size.x.min(760.0), default_size.y.min(480.0));
+    (default_size, minimum_size)
 }
 
 fn configure_theme(ctx: &egui::Context) {
@@ -1921,6 +2999,8 @@ fn sample_sessions() -> Vec<Session> {
                         process_path: r"C:\Program Files\Google\Chrome\Application\chrome.exe"
                             .into(),
                         pid: Some(4301 + index as u32),
+                        provenance: Default::default(),
+                        guard: Default::default(),
                     },
                     response: Some(CapturedResponse {
                         status,
@@ -1939,6 +3019,7 @@ fn sample_sessions() -> Vec<Session> {
                     pinned: false,
                     notes: String::new(),
                     threat: ThreatAssessment::default(),
+                    behavior: Default::default(),
                 })
             },
         )
@@ -1998,6 +3079,16 @@ mod tests {
         for size in &sizes[3..] {
             assert_eq!(*size, stable_size);
         }
+    }
+
+    #[test]
+    fn workbench_size_stays_inside_a_high_dpi_logical_screen() {
+        let screen = Vec2::new(864.0, 486.0);
+        let (default_size, minimum_size) = workbench_window_sizes(screen);
+        assert_eq!(default_size, Vec2::new(832.0, 414.0));
+        assert_eq!(minimum_size, Vec2::new(760.0, 414.0));
+        assert!(default_size.x + 32.0 <= screen.x);
+        assert!(default_size.y + 72.0 <= screen.y);
     }
 
     #[test]

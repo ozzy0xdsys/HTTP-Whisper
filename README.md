@@ -14,6 +14,16 @@ HTTP Whisper is a native Windows and Linux HTTP, HTTPS, and WebSocket debugging 
 - Live HTTP requests and responses with raw Authorization headers visible in the inspector
 - Live incoming and outgoing WebSocket messages
 - Binary WebSocket decoding for UTF-8, gzip, zlib, raw deflate, and zlib-stream
+- Application timelines with PID, parent process, executable hash, publisher, signature state, and launch time
+- Per-process Learn Normal baselines with visible behavior deviations
+- Windows Bypass Radar for direct IPv4 TCP connections and DNS client-cache observations
+- WebSocket protocol inference, message correlation, schema summaries, protobuf descriptor decoding, and replay
+- Explainable per-session investigation reports with evidence and recommended next steps
+- Warn, redact, or block outbound secrets with configurable trusted-host patterns
+- Persistent host dossiers with process, path, status, byte, warning, DNS, and RDAP history
+- Sanitized, optionally AES-256-GCM encrypted capture capsules for portable investigations
+- Before/after experiment comparison for endpoints, headers, cookies, JSON values, and WebSocket types
+- Rule simulation with condition results, effect previews, hit counts, and one-step rule undo
 - Stateful suspicious-traffic warnings with scored evidence and warning symbols
 - Windows PID/executable attribution and system-idle correlation for proxied traffic
 - Host/path/method automatic response rules with wildcard and `re:` regular-expression matching
@@ -116,6 +126,26 @@ Prefix Find with `re:` for regex replacement. Capture groups can be referenced f
 
 WebSocket messages appear as `WS` rows. `OUT` means client-to-server and `IN` means server-to-client. Selecting a row shows its URL, direction, opcode, decoded format, matched rewrite rule, byte size, and payload.
 
+The **WebSockets** page in **Tools > Investigation Workbench** infers JSON, JSON-RPC, GraphQL, event-stream, MessagePack-like, and protobuf-like traffic. It extracts message types, correlation IDs, sequence values, observed field schemas, and likely request/reply pairs. A compiled protobuf `FileDescriptorSet` can be loaded to try named decoding against the selected binary frame. **Replay Selected Message** opens a separate WebSocket connection and sends the captured frame; authentication requirements still apply.
+
+## Investigation Workbench
+
+Open **Tools > Investigation Workbench** for the deeper analysis tools:
+
+- **Timeline** ties captured activity to the owning executable and its parent, SHA-256 hash, publisher metadata, Authenticode result, and process launch time when Windows exposes them.
+- **Baseline** learns destinations, methods, paths, content types, and WebSocket message types per process. Stop learning to turn new behavior into deviations shown by `changed:true`.
+- **Bypass** polls Windows established IPv4 TCP connections and the DNS client cache so direct traffic that did not enter the proxy is still visible. It is observation-only and does not block connections.
+- **Dossiers** retain host activity across captures. Optional public DNS and RDAP enrichment is off by default and sends the selected host or IP to public lookup services.
+- **Capsules** bundle sessions, rules, the learned baseline, and host dossiers. Sanitization removes sensitive header/body material and raw WebSocket bytes; a non-empty passphrase encrypts the gzip-compressed capsule with AES-256-GCM using a PBKDF2-HMAC-SHA256 key.
+- **Experiments** record before and after windows and report semantic changes rather than only raw byte differences.
+- **Rules** evaluates all auto-response and rewrite conditions against the selected row, previews the result, shows historical hits, and can undo the most recent rule save.
+
+The selected session's **Report** inspector explains why it was flagged, what changed from baseline, what the Data Guard found, and practical follow-up checks. Search fields also include `changed:`, `guard:`, `protocol:`, and `message-type:`.
+
+## Data Guard
+
+Under **File > Settings > Data Guard**, choose **Off**, **Warn only**, **Redact before sending**, or **Block transmission**. The guard checks outbound HTTP headers and bodies plus decoded WebSocket text for authorization credentials, cookies, private keys, tokens, and other explicit secret forms. Redaction modifies the transmitted value while keeping a warning record; blocking returns a local HTTP 451 response or drops the outbound WebSocket frame. Trusted destinations accept exact, wildcard, and `re:` host patterns.
+
 ## Suspicious Traffic Warnings
 
 Traffic warnings are enabled by default under **File > Settings**. Suspicious rows show a warning symbol in the Alert column; hover over it for evidence or select the row and open **Warnings**. Scores combine independent indicators, so an ordinary API request with a missing User-Agent remains a notice while stronger or repeated evidence becomes a visible warning.
@@ -124,13 +154,13 @@ Warning risk never changes row or column colors; suspicious-traffic warnings app
 
 The detector observes raw IP destinations, random-looking hosts, repeated first-seen destinations, fixed-interval HTTP and WebSocket beaconing, long-running WebSocket activity, C2-style paths, URL shorteners and commonly abused hosting/tunnel services, unusual processes and User-Agents, malformed headers, proxy and tunneling indicators, large uploads, encoded outbound messages, outbound traffic spikes, repeated failures followed by alternate destinations, TLS validation failures, and credentials, cookies, files, screenshots, or system information sent over plaintext HTTP. On Windows, HTTP Whisper resolves loopback connections to their PID and executable and can warn when suspicious outbound traffic occurs after the configured system-idle threshold.
 
-Use filters such as `warning:true`, `risk:high`, `score:>=30`, `process:powershell.exe`, or `pid:1234` to isolate findings.
+Use filters such as `warning:true`, `risk:high`, `score:>=30`, `process:powershell.exe`, `pid:1234`, `changed:true`, or `guard:blocked` to isolate findings.
 
-Warnings are heuristic evidence, not a malware verdict. HTTP Whisper can inspect only traffic routed through its proxy. It does not currently monitor system DNS queries, verify domain registration age, inspect traffic that bypasses the proxy, or expose successful upstream certificate metadata; certificate warnings are available when TLS validation fails. Process attribution and system-idle detection are currently Windows-only.
+Warnings are heuristic evidence, not a malware verdict. Full HTTP bodies and WebSocket contents are available only for traffic routed through the proxy. Bypass Radar adds observation-only visibility into the Windows DNS client cache and established IPv4 TCP connections, but it is not packet capture, does not cover every protocol or IPv6 connection, and cannot decrypt bypassing TLS. Public RDAP enrichment can expose registration dates where registries provide them. Successful upstream certificate metadata is not currently retained; certificate warnings are available when TLS validation fails. Process provenance, bypass detection, and system-idle detection are currently Windows-only.
 
 ## Data And Security
 
-On Windows, settings, certificates, bodies, and session metadata are stored under `%LOCALAPPDATA%\HTTP Whisper\HTTP Whisper`. On Linux they use the platform application-data directory, normally under `~/.local/share`. These files can contain sensitive traffic and credentials. Raw headers remain visible inside the local inspector, while exports redact Authorization, proxy authorization, cookies, and set-cookie values.
+On Windows, settings, certificates, bodies, session metadata, baselines, dossiers, and capsules are stored under `%LOCALAPPDATA%\HTTP Whisper\HTTP Whisper`. On Linux they use the platform application-data directory, normally under `~/.local/share`. These files can contain sensitive traffic and credentials. Raw headers remain visible inside the local inspector, while normal exports redact Authorization, proxy authorization, cookies, and set-cookie values. Capture capsules should be sanitized and encrypted before sharing.
 
 Only inspect systems and traffic that you own or are explicitly authorized to inspect.
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.0 - 2026-07-18
+
+- Add an Investigation Workbench without changing the Classic XP capture workflow.
+- Add application timelines with PID, parent process, executable SHA-256, publisher metadata, Authenticode status, and process launch time on Windows.
+- Add persistent per-process Learn Normal baselines and mark new destinations, paths, methods, content types, and WebSocket message types.
+- Add a Windows Bypass Radar for established direct IPv4 TCP connections and DNS client-cache observations.
+- Add WebSocket protocol inference, schema and correlation analysis, protobuf descriptor decoding, and live message replay.
+- Add explainable session reports with warning evidence, process context, baseline changes, guard findings, and next-step guidance.
+- Add an outbound Data Guard with warn, redact, and block modes plus wildcard or regex trusted destinations.
+- Add persistent host dossiers with process, endpoint, status, traffic, warning, TLS-failure, bypass, DNS, and RDAP context.
+- Add sanitized capture capsules with optional AES-256-GCM encryption and PBKDF2-HMAC-SHA256 key derivation.
+- Add before/after semantic experiments covering endpoints, headers, cookies, JSON values, and WebSocket message types.
+- Add visual rule simulation reports, effect previews, historical hit counts, and one-step rule undo.
+- Add `changed:`, `guard:`, `protocol:`, and `message-type:` filters.
+- Keep resizable workbench content and large text editors scrollable without progressive window growth.
+
 ## 0.7.3 - 2026-07-18
 
 - Automatically render table text using the exact inverse RGB color of each configured background.

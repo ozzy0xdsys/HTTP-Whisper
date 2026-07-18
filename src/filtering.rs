@@ -52,6 +52,12 @@ fn field_matches(session: &Session, field: &str, value: &str) -> bool {
         ("warning", item) => value
             .parse::<bool>()
             .is_ok_and(|expected| item.threat().is_warning() == expected),
+        ("changed", item) => value
+            .parse::<bool>()
+            .is_ok_and(|expected| item.behavior().is_unusual() == expected),
+        ("guard", item) => wildcard(item.guard().action.label(), value),
+        ("protocol", Session::WebSocket(item)) => wildcard(&item.analysis.protocol, value),
+        ("message-type", Session::WebSocket(item)) => wildcard(&item.analysis.message_type, value),
         _ => text_contains_pattern(&session.searchable_text(), value, false),
     }
 }
@@ -84,8 +90,8 @@ fn numeric_match(actual: f64, expression: &str) -> bool {
 mod tests {
     use super::*;
     use crate::model::{
-        CapturedExchange, CapturedRequest, CapturedResponse, Session, ThreatAssessment,
-        ThreatFinding, ThreatLevel,
+        CapturedExchange, CapturedRequest, CapturedResponse, GuardAction, Session,
+        ThreatAssessment, ThreatFinding, ThreatLevel,
     };
     use chrono::Utc;
     use uuid::Uuid;
@@ -108,6 +114,8 @@ mod tests {
                 process: "firefox.exe".into(),
                 process_path: String::new(),
                 pid: None,
+                provenance: Default::default(),
+                guard: Default::default(),
             },
             response: Some(CapturedResponse {
                 status: 404,
@@ -131,6 +139,7 @@ mod tests {
                     score: 35,
                 }],
             },
+            behavior: Default::default(),
         })
     }
 
@@ -158,5 +167,18 @@ mod tests {
         assert!(matches_filter(&session, r"re:api\.example\.com"));
         assert!(matches_filter(&session, r"process:re:^firefox\.exe$"));
         assert!(!matches_filter(&session, r"host:re:^www\."));
+    }
+
+    #[test]
+    fn filters_baseline_changes_and_guard_actions() {
+        let mut session = session();
+        if let Session::Http(exchange) = &mut session {
+            exchange.behavior.baseline_available = true;
+            exchange.behavior.changes.push("New destination".into());
+            exchange.request.guard.action = GuardAction::Redacted;
+        }
+
+        assert!(matches_filter(&session, "changed:true guard:redact*"));
+        assert!(!matches_filter(&session, "changed:false"));
     }
 }

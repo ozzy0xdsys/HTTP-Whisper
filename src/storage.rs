@@ -179,6 +179,8 @@ mod tests {
                 process: String::new(),
                 process_path: String::new(),
                 pid: None,
+                provenance: Default::default(),
+                guard: Default::default(),
             },
             response: None,
             rule_matched: None,
@@ -195,6 +197,7 @@ mod tests {
                     score: 30,
                 }],
             },
+            behavior: Default::default(),
         };
         repository.add_exchange(&exchange).unwrap();
         let loaded = repository.get_exchange(exchange.id).unwrap().unwrap();

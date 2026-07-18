@@ -101,6 +101,8 @@ mod tests {
                 process: String::new(),
                 process_path: String::new(),
                 pid: None,
+                provenance: Default::default(),
+                guard: Default::default(),
             },
             response: None,
             rule_matched: None,
@@ -109,6 +111,7 @@ mod tests {
             pinned: false,
             notes: String::new(),
             threat: ThreatAssessment::default(),
+            behavior: Default::default(),
         }
     }
 

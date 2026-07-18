@@ -6,6 +6,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::rules::{regex_notation_error, regex_source};
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExfiltrationMode {
+    Off,
+    #[default]
+    Warn,
+    Redact,
+    Block,
+}
+
+impl ExfiltrationMode {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Warn, Self::Redact, Self::Block];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Warn => "Warn only",
+            Self::Redact => "Redact before sending",
+            Self::Block => "Block transmission",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AutoResponseRule {
@@ -251,6 +274,12 @@ pub struct AppSettings {
     pub auto_connect: bool,
     pub threat_detection_enabled: bool,
     pub idle_warning_minutes: u64,
+    pub baseline_learning_enabled: bool,
+    pub bypass_radar_enabled: bool,
+    pub exfiltration_guard_mode: ExfiltrationMode,
+    pub exfiltration_trusted_hosts: Vec<String>,
+    pub host_intelligence_enabled: bool,
+    pub protobuf_descriptor_file: String,
     pub table_color_preset: TableColorPreset,
     pub table_color_rules: Vec<TableColorRule>,
     pub theme: String,
@@ -276,6 +305,12 @@ impl Default for AppSettings {
             auto_connect: false,
             threat_detection_enabled: true,
             idle_warning_minutes: 5,
+            baseline_learning_enabled: false,
+            bypass_radar_enabled: cfg!(windows),
+            exfiltration_guard_mode: ExfiltrationMode::Warn,
+            exfiltration_trusted_hosts: Vec::new(),
+            host_intelligence_enabled: false,
+            protobuf_descriptor_file: String::new(),
             table_color_preset,
             table_color_rules,
             theme: "system".to_owned(),
@@ -354,6 +389,15 @@ impl AppSettings {
         for host in &self.hidden_hosts {
             validate_regex_field("hidden host", host)?;
         }
+        anyhow::ensure!(
+            self.exfiltration_trusted_hosts
+                .iter()
+                .all(|host| !host.trim().is_empty()),
+            "trusted exfiltration host entries cannot be blank"
+        );
+        for host in &self.exfiltration_trusted_hosts {
+            validate_regex_field("trusted exfiltration host", host)?;
+        }
         for rule in &self.auto_response_rules {
             rule.validate()?;
         }
@@ -381,6 +425,9 @@ pub struct AppPaths {
     pub certificates_dir: PathBuf,
     pub bodies_dir: PathBuf,
     pub sessions_dir: PathBuf,
+    pub baselines_file: PathBuf,
+    pub dossiers_file: PathBuf,
+    pub capsules_dir: PathBuf,
 }
 
 impl AppPaths {
@@ -393,6 +440,9 @@ impl AppPaths {
             certificates_dir: data_dir.join("certificates"),
             bodies_dir: data_dir.join("bodies"),
             sessions_dir: data_dir.join("sessions"),
+            baselines_file: data_dir.join("baselines.json"),
+            dossiers_file: data_dir.join("host-dossiers.json"),
+            capsules_dir: data_dir.join("capsules"),
             data_dir,
         })
     }
@@ -403,6 +453,7 @@ impl AppPaths {
             &self.certificates_dir,
             &self.bodies_dir,
             &self.sessions_dir,
+            &self.capsules_dir,
         ] {
             fs::create_dir_all(path)?;
         }
@@ -448,6 +499,12 @@ mod tests {
         assert!(!settings.auto_connect);
         assert!(settings.threat_detection_enabled);
         assert_eq!(settings.idle_warning_minutes, 5);
+        assert!(!settings.baseline_learning_enabled);
+        assert_eq!(settings.bypass_radar_enabled, cfg!(windows));
+        assert_eq!(settings.exfiltration_guard_mode, ExfiltrationMode::Warn);
+        assert!(settings.exfiltration_trusted_hosts.is_empty());
+        assert!(!settings.host_intelligence_enabled);
+        assert!(settings.protobuf_descriptor_file.is_empty());
         assert_eq!(settings.table_color_preset, TableColorPreset::HttpStatus);
         assert_eq!(settings.table_color_rules.len(), 3);
         assert_eq!(settings.table_color_rules[0].pattern, "5xx");

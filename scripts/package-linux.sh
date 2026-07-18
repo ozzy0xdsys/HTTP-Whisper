@@ -7,9 +7,9 @@ stage="$dist/HTTP-Whisper-linux-x86_64"
 archive="$dist/HTTP-Whisper-linux-x86_64.tar.gz"
 
 cd "$root"
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
 
 rm -rf "$stage"
 mkdir -p "$stage"

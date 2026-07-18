@@ -33,9 +33,11 @@ use uuid::Uuid;
 use crate::{
     certificate::{install_current_user_ca, load_or_create_ca},
     config::{AppPaths, AppSettings},
+    guard::{protect_http, protect_websocket_text},
     model::{
-        CaptureEvent, CapturedExchange, CapturedRequest, CapturedResponse, Direction, Header,
-        Headers, ThreatAssessment, WebSocketMessage,
+        BehaviorAssessment, CaptureEvent, CapturedExchange, CapturedRequest, CapturedResponse,
+        Direction, GuardAction, GuardAssessment, Header, Headers, ProcessProvenance,
+        ThreatAssessment, WebSocketAnalysis, WebSocketMessage,
     },
     platform,
     rules::{apply_rewrite, find_auto_response, host_is_hidden, matching_rewrites},
@@ -267,8 +269,8 @@ impl HttpHandler for TrafficHandler {
         } else {
             request
         };
-        let (parts, body) = request.into_parts();
-        let body = match body.collect().await {
+        let (mut parts, body) = request.into_parts();
+        let mut body = match body.collect().await {
             Ok(value) => value.to_bytes().to_vec(),
             Err(error) => {
                 let _ = self.shared.events.send(CaptureEvent::Error(format!(
@@ -277,7 +279,7 @@ impl HttpHandler for TrafficHandler {
                 Vec::new()
             }
         };
-        let captured = request_from_parts(&parts, body.clone(), context);
+        let mut captured = request_from_parts(&parts, body.clone(), context);
         let settings = self.shared.settings.read().clone();
         let hidden = host_is_hidden(&captured.host, &settings.hidden_hosts);
         let rule = find_auto_response(
@@ -325,6 +327,7 @@ impl HttpHandler for TrafficHandler {
                     pinned: false,
                     notes: String::new(),
                     threat: ThreatAssessment::default(),
+                    behavior: BehaviorAssessment::default(),
                 };
                 let _ = self.shared.events.send(CaptureEvent::Exchange(exchange));
             }
@@ -334,6 +337,53 @@ impl HttpHandler for TrafficHandler {
                 .body(Body::from(response_body))
                 .unwrap_or_else(|_| Response::new(Body::from("invalid automatic response")));
             return RequestOrResponse::Response(response);
+        }
+        let guard = protect_http(
+            &mut captured,
+            settings.exfiltration_guard_mode,
+            &settings.exfiltration_trusted_hosts,
+        );
+        captured.guard = guard.clone();
+        if guard.action == GuardAction::Blocked {
+            let response_body =
+                br#"{"blocked":true,"reason":"HTTP Whisper exfiltration guard"}"#.to_vec();
+            if !hidden {
+                let exchange = CapturedExchange {
+                    id: Uuid::new_v4(),
+                    sequence: self.shared.next_sequence(),
+                    request: captured,
+                    response: Some(CapturedResponse {
+                        status: 451,
+                        reason: "Blocked by HTTP Whisper".into(),
+                        version: "HTTP/1.1".into(),
+                        headers: vec![Header {
+                            name: "content-type".into(),
+                            value: "application/json".into(),
+                        }],
+                        body: response_body.clone(),
+                        duration_ms: 0.0,
+                    }),
+                    rule_matched: Some("Exfiltration guard".into()),
+                    error: None,
+                    synthetic: true,
+                    pinned: false,
+                    notes: "Outbound request blocked before transmission".into(),
+                    threat: ThreatAssessment::default(),
+                    behavior: BehaviorAssessment::default(),
+                };
+                let _ = self.shared.events.send(CaptureEvent::Exchange(exchange));
+            }
+            let response = Response::builder()
+                .status(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(response_body))
+                .unwrap_or_else(|_| Response::new(Body::from("blocked")));
+            return RequestOrResponse::Response(response);
+        }
+        if guard.action == GuardAction::Redacted {
+            body.clone_from(&captured.body);
+            redact_outbound_header_map(&mut parts.headers);
+            parts.headers.remove(header::CONTENT_LENGTH);
         }
         self.pending = Some(PendingRequest {
             request: captured,
@@ -421,6 +471,7 @@ impl HttpHandler for TrafficHandler {
                     pinned: false,
                     notes: String::new(),
                     threat: ThreatAssessment::default(),
+                    behavior: BehaviorAssessment::default(),
                 };
                 let _ = self.shared.events.send(CaptureEvent::Exchange(exchange));
             }
@@ -448,6 +499,7 @@ impl HttpHandler for TrafficHandler {
                     pinned: false,
                     notes: String::new(),
                     threat: ThreatAssessment::default(),
+                    behavior: BehaviorAssessment::default(),
                 };
                 let _ = self.shared.events.send(CaptureEvent::Exchange(exchange));
             }
@@ -493,8 +545,11 @@ impl WebSocketHandler for WebSocketTrafficHandler {
             return Some(message);
         }
         let opcode = websocket_opcode(&message).to_owned();
+        let original_wire_payload =
+            message_payload_bytes(&message, settings.body_memory_limit_bytes);
         let mut decoded = self.decode_message(direction, &message);
         let mut matched_names = Vec::new();
+        let mut guard = GuardAssessment::default();
         if let Some(text) = decoded.text.clone() {
             let mut rewritten = text;
             for rule in matching_rewrites(&host, &settings.response_rewrite_rules) {
@@ -504,13 +559,21 @@ impl WebSocketHandler for WebSocketTrafficHandler {
                     rewritten = value;
                 }
             }
-            if !matched_names.is_empty() {
+            if direction == Direction::Out {
+                let (protected, assessment) = protect_websocket_text(
+                    &host,
+                    &rewritten,
+                    settings.exfiltration_guard_mode,
+                    &settings.exfiltration_trusted_hosts,
+                );
+                guard = assessment;
+                rewritten = protected;
+            }
+            if !matched_names.is_empty() || guard.action == GuardAction::Redacted {
                 decoded.preview = rewritten.clone();
                 decoded.text = Some(rewritten);
             }
         }
-        let forwarded =
-            self.encode_message(direction, message, &decoded, !matched_names.is_empty());
         let scheme = if uri.scheme_str() == Some("https") {
             "wss"
         } else {
@@ -518,7 +581,8 @@ impl WebSocketHandler for WebSocketTrafficHandler {
         };
         let url = format!("{scheme}://{host}{path}");
         let process = platform::resolve_client(client_addr);
-        let event = WebSocketMessage {
+        let provenance = process_provenance(&process);
+        let mut event = WebSocketMessage {
             id: Uuid::new_v4(),
             sequence: self.shared.next_sequence(),
             url,
@@ -527,16 +591,30 @@ impl WebSocketHandler for WebSocketTrafficHandler {
             direction,
             opcode,
             is_text: decoded.kind == DecodeKind::Text,
-            payload: decoded.preview,
+            payload: decoded.preview.clone(),
             raw_size: decoded.raw_size,
-            decoded_as: decoded.label,
+            decoded_as: decoded.label.clone(),
             rule_matched: (!matched_names.is_empty()).then(|| matched_names.join(", ")),
             timestamp: Utc::now(),
             process: process.name,
             process_path: process.path,
             pid: process.pid,
             threat: ThreatAssessment::default(),
+            provenance,
+            guard,
+            behavior: BehaviorAssessment::default(),
+            analysis: WebSocketAnalysis::default(),
+            wire_payload: original_wire_payload,
+            synthetic: false,
         };
+        if event.guard.action == GuardAction::Blocked {
+            event.synthetic = true;
+            let _ = self.shared.events.send(CaptureEvent::WebSocket(event));
+            return None;
+        }
+        let rewritten = !matched_names.is_empty() || event.guard.action == GuardAction::Redacted;
+        let forwarded = self.encode_message(direction, message, &decoded, rewritten);
+        event.wire_payload = message_payload_bytes(&forwarded, settings.body_memory_limit_bytes);
         let _ = self.shared.events.send(CaptureEvent::WebSocket(event));
         Some(forwarded)
     }
@@ -791,6 +869,7 @@ fn request_from_parts(
         .port_u16()
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
     let process = platform::resolve_client(context.client_addr);
+    let provenance = process_provenance(&process);
     CapturedRequest {
         method: parts.method.to_string(),
         scheme,
@@ -809,7 +888,48 @@ fn request_from_parts(
         process: process.name,
         process_path: process.path,
         pid: process.pid,
+        provenance,
+        guard: GuardAssessment::default(),
     }
+}
+
+fn process_provenance(process: &platform::ProcessIdentity) -> ProcessProvenance {
+    ProcessProvenance {
+        parent_pid: process.parent_pid,
+        parent_process: process.parent_name.clone(),
+        executable_sha256: process.executable_sha256.clone(),
+        publisher: process.publisher.clone(),
+        signature_valid: process.signature_valid,
+        started_at: process.started_at,
+    }
+}
+
+fn redact_outbound_header_map(headers: &mut hudsucker::hyper::HeaderMap) {
+    for name in [
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "x-api-key",
+        "x-auth-token",
+    ] {
+        if let Ok(name) = hudsucker::hyper::header::HeaderName::from_bytes(name.as_bytes())
+            && headers.contains_key(&name)
+        {
+            headers.insert(
+                name,
+                hudsucker::hyper::header::HeaderValue::from_static("<redacted-by-http-whisper>"),
+            );
+        }
+    }
+}
+
+fn message_payload_bytes(message: &Message, limit: usize) -> Vec<u8> {
+    let bytes: &[u8] = match message {
+        Message::Text(value) => value.as_bytes(),
+        Message::Binary(value) | Message::Ping(value) | Message::Pong(value) => value,
+        Message::Close(_) | Message::Frame(_) => &[],
+    };
+    bytes[..bytes.len().min(limit)].to_vec()
 }
 
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
@@ -1083,6 +1203,31 @@ fn hex_preview(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn start_test_worker(
+        mut settings: AppSettings,
+    ) -> (CaptureWorker, std::sync::mpsc::Receiver<CaptureEvent>, u16) {
+        for _ in 0..10 {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            settings.capture_port = port;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut worker = CaptureWorker::start(settings.clone(), tx).unwrap();
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap() {
+                    CaptureEvent::Started { .. } => return (worker, rx, port),
+                    CaptureEvent::Error(error) if error.contains("cannot listen") => {
+                        worker.join();
+                        break;
+                    }
+                    CaptureEvent::Error(error) => panic!("proxy failed to start: {error}"),
+                    _ => {}
+                }
+            }
+        }
+        panic!("could not reserve a proxy test port after 10 attempts");
+    }
+
     #[test]
     fn decodes_utf8_binary() {
         let decoded = decode_binary_stateless(b"hello").unwrap();
@@ -1159,16 +1304,11 @@ mod tests {
     fn native_proxy_serves_and_captures_an_automatic_response() {
         use std::{
             io::{Read, Write},
-            net::{TcpListener, TcpStream},
-            sync::mpsc,
+            net::TcpStream,
             time::Duration,
         };
 
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
         let settings = AppSettings {
-            capture_port: port,
             enable_https_interception: false,
             auto_configure_system_proxy: false,
             auto_install_ca: false,
@@ -1184,15 +1324,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let (tx, rx) = mpsc::channel();
-        let mut worker = CaptureWorker::start(settings, tx).unwrap();
-        loop {
-            match rx.recv_timeout(Duration::from_secs(20)).unwrap() {
-                CaptureEvent::Started { .. } => break,
-                CaptureEvent::Error(error) => panic!("proxy failed to start: {error}"),
-                _ => {}
-            }
-        }
+        let (mut worker, rx, port) = start_test_worker(settings);
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         stream
@@ -1225,30 +1357,17 @@ mod tests {
     fn native_proxy_serves_local_mitm_it_certificate_page() {
         use std::{
             io::{Read, Write},
-            net::{TcpListener, TcpStream},
-            sync::mpsc,
+            net::TcpStream,
             time::Duration,
         };
 
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
         let settings = AppSettings {
-            capture_port: port,
             enable_https_interception: false,
             auto_configure_system_proxy: false,
             auto_install_ca: false,
             ..Default::default()
         };
-        let (tx, rx) = mpsc::channel();
-        let mut worker = CaptureWorker::start(settings, tx).unwrap();
-        loop {
-            match rx.recv_timeout(Duration::from_secs(20)).unwrap() {
-                CaptureEvent::Started { .. } => break,
-                CaptureEvent::Error(error) => panic!("proxy failed to start: {error}"),
-                _ => {}
-            }
-        }
+        let (mut worker, _rx, port) = start_test_worker(settings);
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         stream
@@ -1275,7 +1394,6 @@ mod tests {
         use std::{
             io::{Read, Write},
             net::{TcpListener, TcpStream},
-            sync::mpsc,
             thread,
             time::Duration,
         };
@@ -1292,11 +1410,7 @@ mod tests {
                 )
                 .unwrap();
         });
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let proxy_port = probe.local_addr().unwrap().port();
-        drop(probe);
         let settings = AppSettings {
-            capture_port: proxy_port,
             enable_https_interception: false,
             auto_configure_system_proxy: false,
             auto_install_ca: false,
@@ -1308,15 +1422,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let (tx, rx) = mpsc::channel();
-        let mut worker = CaptureWorker::start(settings, tx).unwrap();
-        loop {
-            match rx.recv_timeout(Duration::from_secs(20)).unwrap() {
-                CaptureEvent::Started { .. } => break,
-                CaptureEvent::Error(error) => panic!("proxy failed to start: {error}"),
-                _ => {}
-            }
-        }
+        let (mut worker, rx, proxy_port) = start_test_worker(settings);
 
         let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
         let request = format!(

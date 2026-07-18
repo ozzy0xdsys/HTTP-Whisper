@@ -1048,6 +1048,8 @@ mod tests {
                 process: "firefox.exe".into(),
                 process_path: String::new(),
                 pid: Some(10),
+                provenance: Default::default(),
+                guard: Default::default(),
             },
             response: Some(CapturedResponse {
                 status: 200,
@@ -1063,6 +1065,7 @@ mod tests {
             pinned: false,
             notes: String::new(),
             threat: ThreatAssessment::default(),
+            behavior: Default::default(),
         }
     }
 
@@ -1185,6 +1188,12 @@ mod tests {
                 process_path: String::new(),
                 pid: Some(20),
                 threat: ThreatAssessment::default(),
+                provenance: Default::default(),
+                guard: Default::default(),
+                behavior: Default::default(),
+                analysis: Default::default(),
+                wire_payload: Vec::new(),
+                synthetic: false,
             };
             latest = analyzer.analyze_websocket(&message, None, Duration::from_secs(5 * 60));
         }
