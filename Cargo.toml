@@ -1,6 +1,6 @@
 [package]
 name = "http-whisper"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 description = "A native HTTP/HTTPS and WebSocket debugging proxy for Windows and Linux"
 license = "MIT"
@@ -32,7 +32,11 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 winreg = "0.55"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinInet",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

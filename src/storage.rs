@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn session_repository_round_trips_exchanges() {
-        use crate::model::{CapturedRequest, Header};
+        use crate::model::{CapturedRequest, Header, ThreatAssessment, ThreatFinding, ThreatLevel};
         use chrono::Utc;
 
         let temp = tempfile::tempdir().unwrap();
@@ -177,6 +177,7 @@ mod tests {
                 timestamp: Utc::now(),
                 client_addr: "127.0.0.1:50000".into(),
                 process: String::new(),
+                process_path: String::new(),
                 pid: None,
             },
             response: None,
@@ -185,10 +186,20 @@ mod tests {
             synthetic: false,
             pinned: false,
             notes: String::new(),
+            threat: ThreatAssessment {
+                score: 30,
+                level: ThreatLevel::Suspicious,
+                findings: vec![ThreatFinding {
+                    title: "Raw IP".into(),
+                    evidence: "Connected to 127.0.0.1".into(),
+                    score: 30,
+                }],
+            },
         };
         repository.add_exchange(&exchange).unwrap();
         let loaded = repository.get_exchange(exchange.id).unwrap().unwrap();
         assert_eq!(loaded.request.host, "example.test");
+        assert!(loaded.threat.is_warning());
         assert_eq!(repository.list_exchanges(10, 0).unwrap().len(), 1);
         repository.delete_exchange(exchange.id).unwrap();
         assert!(repository.get_exchange(exchange.id).unwrap().is_none());

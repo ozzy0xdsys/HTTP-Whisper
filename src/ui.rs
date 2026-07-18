@@ -14,9 +14,11 @@ use crate::{
     filtering::matches_filter,
     model::{
         CaptureEvent, CapturedExchange, CapturedRequest, CapturedResponse, Header, Session,
-        WebSocketMessage, headers_as_text,
+        ThreatAssessment, ThreatLevel, WebSocketMessage, headers_as_text,
     },
+    platform,
     storage::SessionRepository,
+    threat::ThreatAnalyzer,
     windows_proxy::configure_startup,
 };
 
@@ -33,6 +35,8 @@ const XP_BORDER: Color32 = Color32::from_rgb(127, 157, 185);
 const XP_BLUE: Color32 = Color32::from_rgb(49, 106, 197);
 const XP_WHITE: Color32 = Color32::WHITE;
 const XP_TEXT: Color32 = Color32::from_rgb(0, 0, 0);
+const XP_WARNING: Color32 = Color32::from_rgb(180, 105, 0);
+const XP_DANGER: Color32 = Color32::from_rgb(190, 0, 0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DialogKind {
@@ -66,6 +70,7 @@ pub struct HttpWhisperApp {
     activity: String,
     status: String,
     errors: usize,
+    threat_analyzer: ThreatAnalyzer,
 }
 
 impl HttpWhisperApp {
@@ -109,6 +114,7 @@ impl HttpWhisperApp {
                 |error| format!("Startup setting could not be synchronized: {error}"),
             ),
             errors: 0,
+            threat_analyzer: ThreatAnalyzer::default(),
         }
     }
 
@@ -136,7 +142,8 @@ impl HttpWhisperApp {
                     }
                     self.activity = message;
                 }
-                CaptureEvent::Exchange(exchange) => {
+                CaptureEvent::Exchange(mut exchange) => {
+                    self.assess_http(&mut exchange);
                     self.activity = exchange.request.url();
                     if let Some(repository) = &self.repository
                         && let Err(error) = repository.add_exchange(&exchange)
@@ -146,7 +153,8 @@ impl HttpWhisperApp {
                     }
                     self.push_session(Session::Http(exchange));
                 }
-                CaptureEvent::ReplayCompleted(exchange) => {
+                CaptureEvent::ReplayCompleted(mut exchange) => {
+                    self.assess_http(&mut exchange);
                     self.activity = format!("Replay completed: {}", exchange.request.url());
                     self.status = exchange
                         .response
@@ -158,6 +166,7 @@ impl HttpWhisperApp {
                             )
                         })
                         .unwrap_or_else(|| "Replay completed".into());
+                    self.announce_threat(&exchange.threat);
                     self.selected = Some(exchange.id);
                     if let Some(repository) = &self.repository
                         && let Err(error) = repository.add_exchange(&exchange)
@@ -167,7 +176,8 @@ impl HttpWhisperApp {
                     }
                     self.push_session(Session::Http(exchange));
                 }
-                CaptureEvent::WebSocket(message) => {
+                CaptureEvent::WebSocket(mut message) => {
+                    self.assess_websocket(&mut message);
                     self.activity =
                         format!("WebSocket {} {}", message.direction.label(), message.url);
                     self.push_session(Session::WebSocket(message));
@@ -207,6 +217,7 @@ impl HttpWhisperApp {
         self.sessions.clear();
         self.selected = None;
         self.errors = 0;
+        self.threat_analyzer.reset();
         self.state = "Starting".into();
         self.ca_state = "Installing".into();
         self.status = "Starting native Rust capture".into();
@@ -232,6 +243,36 @@ impl HttpWhisperApp {
             if self.selected == Some(removed.id()) {
                 self.selected = None;
             }
+        }
+    }
+
+    fn assess_http(&mut self, exchange: &mut CapturedExchange) {
+        if !self.settings.threat_detection_enabled {
+            exchange.threat = ThreatAssessment::default();
+            return;
+        }
+        let threshold = Duration::from_secs(self.settings.idle_warning_minutes * 60);
+        exchange.threat =
+            self.threat_analyzer
+                .analyze_http(exchange, platform::idle_duration(), threshold);
+        self.announce_threat(&exchange.threat);
+    }
+
+    fn assess_websocket(&mut self, message: &mut WebSocketMessage) {
+        if !self.settings.threat_detection_enabled {
+            message.threat = ThreatAssessment::default();
+            return;
+        }
+        let threshold = Duration::from_secs(self.settings.idle_warning_minutes * 60);
+        message.threat =
+            self.threat_analyzer
+                .analyze_websocket(message, platform::idle_duration(), threshold);
+        self.announce_threat(&message.threat);
+    }
+
+    fn announce_threat(&mut self, threat: &ThreatAssessment) {
+        if let Some(finding) = threat.primary_finding().filter(|_| threat.is_warning()) {
+            self.status = format!("Warning: {} - {}", finding.title, finding.evidence);
         }
     }
 
@@ -371,6 +412,7 @@ impl HttpWhisperApp {
                         replayed.error = None;
                         replayed.pinned = false;
                         replayed.notes = "Replayed request".into();
+                        replayed.threat = ThreatAssessment::default();
                         let _ = events.send(CaptureEvent::ReplayCompleted(replayed));
                     }
                     Err(error) => {
@@ -476,6 +518,12 @@ impl HttpWhisperApp {
             );
             metric(ui, "HTTPS CA", &self.ca_state, 115.0);
             metric(ui, "Sessions", &self.sessions.len().to_string(), 72.0);
+            let warnings = self
+                .sessions
+                .iter()
+                .filter(|session| session.threat().is_warning())
+                .count();
+            metric(ui, "Warnings", &warnings.to_string(), 72.0);
             metric(ui, "Errors", &self.errors.to_string(), 65.0);
             let remaining = ui.available_width().max(180.0);
             group_box(ui, "Activity", Vec2::new(remaining, 49.0), |ui| {
@@ -514,7 +562,7 @@ impl HttpWhisperApp {
                     .id_salt("sessions-horizontal")
                     .max_height(height)
                     .show(ui, |ui| {
-                        ui.set_min_width(1870.0);
+                        ui.set_min_width(1915.0);
                         let mut table = TableBuilder::new(ui)
                             .id_salt("sessions")
                             .striped(true)
@@ -523,8 +571,8 @@ impl HttpWhisperApp {
                             .min_scrolled_height(60.0)
                             .max_scroll_height(height - 2.0);
                         for width in [
-                            42.0, 45.0, 70.0, 40.0, 90.0, 48.0, 65.0, 55.0, 145.0, 52.0, 260.0,
-                            55.0, 145.0, 70.0, 75.0, 70.0, 115.0, 150.0,
+                            45.0, 42.0, 45.0, 70.0, 40.0, 90.0, 48.0, 65.0, 55.0, 145.0, 52.0,
+                            260.0, 55.0, 145.0, 70.0, 75.0, 70.0, 115.0, 150.0,
                         ] {
                             table =
                                 table.column(Column::initial(width).at_least(38.0).resizable(true));
@@ -532,6 +580,7 @@ impl HttpWhisperApp {
                         table
                             .header(22.0, |mut header| {
                                 for title in [
+                                    "Alert",
                                     "Type",
                                     "Seq",
                                     "Timestamp",
@@ -561,6 +610,9 @@ impl HttpWhisperApp {
                                     let session = &rows[row.index()];
                                     let id = session.id();
                                     row.set_selected(self.selected == Some(id));
+                                    row.col(|ui| {
+                                        threat_indicator(ui, session.threat());
+                                    });
                                     for value in row_values(session) {
                                         row.col(|ui| {
                                             ui.add(egui::Label::new(value).truncate());
@@ -620,7 +672,9 @@ impl HttpWhisperApp {
     }
 
     fn inspector(&mut self, ui: &mut Ui) {
-        let tabs = ["Overview", "Request", "Response", "Headers", "Raw", "Notes"];
+        let tabs = [
+            "Overview", "Warnings", "Request", "Response", "Headers", "Raw", "Notes",
+        ];
         Frame::new()
             .fill(XP_BG)
             .stroke(Stroke::new(1.0, XP_BORDER))
@@ -651,9 +705,13 @@ impl HttpWhisperApp {
         let Some(session) = self.selected_session() else {
             return "Select a session".into();
         };
+        if self.tab == 1 {
+            return threat_inspector(session.threat());
+        }
+        let content_tab = if self.tab > 1 { self.tab - 1 } else { self.tab };
         match session {
-            Session::Http(exchange) => http_inspector(exchange, self.tab),
-            Session::WebSocket(message) => websocket_inspector(message, self.tab),
+            Session::Http(exchange) => http_inspector(exchange, content_tab),
+            Session::WebSocket(message) => websocket_inspector(message, content_tab),
         }
     }
 
@@ -682,7 +740,7 @@ impl HttpWhisperApp {
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
-            .fixed_size([470.0, 360.0])
+            .fixed_size([470.0, 400.0])
             .show(ui.ctx(), |ui| {
                 egui::Grid::new("settings-grid")
                     .num_columns(2)
@@ -735,6 +793,19 @@ impl HttpWhisperApp {
                         }
                         ui.label("On launch");
                         ui.checkbox(&mut self.settings_draft.auto_connect, "Auto-connect");
+                        ui.end_row();
+                        ui.label("Traffic warnings");
+                        ui.checkbox(
+                            &mut self.settings_draft.threat_detection_enabled,
+                            "Detect suspicious activity",
+                        );
+                        ui.end_row();
+                        ui.label("Idle threshold");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings_draft.idle_warning_minutes)
+                                .range(1..=120)
+                                .suffix(" min"),
+                        );
                         ui.end_row();
                     });
                 ui.separator();
@@ -975,7 +1046,7 @@ impl HttpWhisperApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     ui.heading("HTTP Whisper");
-                    ui.label("Version 0.6.1");
+                    ui.label("Version 0.7.0");
                     ui.add_space(8.0);
                     ui.label("Native Rust HTTP/HTTPS and WebSocket debugging workbench");
                     ui.label("Classic Windows XP interface");
@@ -1246,6 +1317,37 @@ fn parse_hidden_hosts(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn threat_indicator(ui: &mut Ui, threat: &ThreatAssessment) {
+    if !threat.is_warning() {
+        return;
+    }
+    let (fill, border) = if threat.level == ThreatLevel::High {
+        (Color32::from_rgb(255, 185, 70), XP_DANGER)
+    } else {
+        (Color32::from_rgb(255, 225, 70), XP_WARNING)
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(17.0, 17.0), egui::Sense::hover());
+    let center = rect.center();
+    let points = vec![
+        egui::pos2(center.x, rect.top() + 1.0),
+        egui::pos2(rect.right() - 1.0, rect.bottom() - 1.0),
+        egui::pos2(rect.left() + 1.0, rect.bottom() - 1.0),
+    ];
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        fill,
+        Stroke::new(1.5, border),
+    ));
+    ui.painter().text(
+        center + egui::vec2(0.0, 2.0),
+        egui::Align2::CENTER_CENTER,
+        "!",
+        FontId::proportional(12.0),
+        XP_TEXT,
+    );
+    response.on_hover_text(threat.tooltip());
+}
+
 fn row_values(session: &Session) -> Vec<String> {
     match session {
         Session::Http(exchange) => {
@@ -1289,8 +1391,11 @@ fn row_values(session: &Session) -> Vec<String> {
             message.sequence.to_string(),
             message.timestamp.format("%H:%M:%S%.3f").to_string(),
             message.direction.label().into(),
-            String::new(),
-            String::new(),
+            message.process.clone(),
+            message
+                .pid
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
             message.opcode.clone(),
             if message.url.starts_with("wss:") {
                 "wss"
@@ -1324,8 +1429,8 @@ fn http_inspector(exchange: &CapturedExchange, tab: usize) -> String {
         .map(|value| headers_as_text(&value.headers))
         .unwrap_or_default();
     match tab {
-        0 => format!("{} {}\nStatus: {}\nDuration: {:.0} ms\nState: {}", request.method, request.url(), response.map(|value| value.status.to_string()).unwrap_or_else(|| "pending".into()), response.map(|value| value.duration_ms).unwrap_or_default(), if exchange.synthetic { "Synthetic" } else { "Completed" }),
-        1 => format!("Method: {}\nURL: {}\nHTTP Version: {}\nClient: {}\nBody Size: {} bytes\n\nBody\n{}", request.method, request.url(), request.version, request.client_addr, request.body.len(), request_body),
+        0 => format!("{} {}\nStatus: {}\nDuration: {:.0} ms\nState: {}\nProcess: {}\nPID: {}\nRisk: {} ({}/100)", request.method, request.url(), response.map(|value| value.status.to_string()).unwrap_or_else(|| "pending".into()), response.map(|value| value.duration_ms).unwrap_or_default(), if exchange.synthetic { "Synthetic" } else { "Completed" }, if request.process.is_empty() { "<unknown>" } else { &request.process }, request.pid.map(|pid| pid.to_string()).unwrap_or_else(|| "<unknown>".into()), exchange.threat.level.label(), exchange.threat.score),
+        1 => format!("Method: {}\nURL: {}\nHTTP Version: {}\nClient: {}\nProcess: {}\nExecutable: {}\nPID: {}\nBody Size: {} bytes\n\nBody\n{}", request.method, request.url(), request.version, request.client_addr, if request.process.is_empty() { "<unknown>" } else { &request.process }, if request.process_path.is_empty() { "<unknown>" } else { &request.process_path }, request.pid.map(|pid| pid.to_string()).unwrap_or_else(|| "<unknown>".into()), request.body.len(), request_body),
         2 => response.map(|value| format!("Status: {} {}\nHTTP Version: {}\nDuration: {:.0} ms\nContent-Type: {}\nBody Size: {} bytes\n\nBody\n{}", value.status, value.reason, value.version, value.duration_ms, value.content_type().unwrap_or("<unknown>"), value.body.len(), response_body)).unwrap_or_else(|| "No response captured yet".into()),
         3 => format!("Request headers\n{}\n\nResponse headers\n{}", request_headers, response_headers),
         4 => format!("{} {} {}\n{}\n\n{}\n\nResponse\n{}\n\n{}", request.method, request.path, request.version, request_headers, request_body, response_headers, response_body),
@@ -1336,18 +1441,43 @@ fn http_inspector(exchange: &CapturedExchange, tab: usize) -> String {
 fn websocket_inspector(message: &WebSocketMessage, tab: usize) -> String {
     match tab {
         0 => format!(
-            "WebSocket {} {}\nOpcode: {}\nSize: {} bytes",
+            "WebSocket {} {}\nOpcode: {}\nSize: {} bytes\nProcess: {}\nPID: {}\nRisk: {} ({}/100)",
             message.direction.label(),
             message.url,
             message.opcode,
-            message.raw_size
+            message.raw_size,
+            if message.process.is_empty() {
+                "<unknown>"
+            } else {
+                &message.process
+            },
+            message
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "<unknown>".into()),
+            message.threat.level.label(),
+            message.threat.score
         ),
         1 => format!(
-            "URL: {}\nHost: {}\nPath: {}\nDirection: {}",
+            "URL: {}\nHost: {}\nPath: {}\nDirection: {}\nProcess: {}\nExecutable: {}\nPID: {}",
             message.url,
             message.host,
             message.path,
-            message.direction.label()
+            message.direction.label(),
+            if message.process.is_empty() {
+                "<unknown>"
+            } else {
+                &message.process
+            },
+            if message.process_path.is_empty() {
+                "<unknown>"
+            } else {
+                &message.process_path
+            },
+            message
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "<unknown>".into())
         ),
         2 => format!(
             "WebSocket Message\nDirection: {}\nOpcode: {}\nDecoded As: {}\nRule: {}\nSize: {} bytes\n\nPayload\n{}",
@@ -1362,6 +1492,30 @@ fn websocket_inspector(message: &WebSocketMessage, tab: usize) -> String {
         4 => message.payload.clone(),
         _ => String::new(),
     }
+}
+
+fn threat_inspector(threat: &ThreatAssessment) -> String {
+    if threat.findings.is_empty() {
+        return "Risk: None\nScore: 0/100\n\nNo suspicious indicators detected for this session."
+            .into();
+    }
+    let findings = threat
+        .findings
+        .iter()
+        .map(|finding| {
+            format!(
+                "+{}  {}\n     {}",
+                finding.score, finding.title, finding.evidence
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "Risk: {}\nScore: {}/100\n\nObserved indicators\n{}\n\nWarnings are heuristic evidence, not confirmation that software is malicious.",
+        threat.level.label(),
+        threat.score,
+        findings
+    )
 }
 
 fn body_preview(body: &[u8], content_type: Option<&str>) -> String {
@@ -1470,6 +1624,8 @@ fn sample_sessions() -> Vec<Session> {
                         timestamp: now + TimeDelta::milliseconds((index as i64 + 1) * 120),
                         client_addr: format!("127.0.0.1:{}", 50_001 + index),
                         process: "chrome.exe".into(),
+                        process_path: r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+                            .into(),
                         pid: Some(4301 + index as u32),
                     },
                     response: Some(CapturedResponse {
@@ -1488,6 +1644,7 @@ fn sample_sessions() -> Vec<Session> {
                     synthetic: index == 1,
                     pinned: false,
                     notes: String::new(),
+                    threat: ThreatAssessment::default(),
                 })
             },
         )

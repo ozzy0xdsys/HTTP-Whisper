@@ -27,6 +27,14 @@ fn field_matches(session: &Session, field: &str, value: &str) -> bool {
         ("path", Session::Http(item)) => wildcard(&item.request.path, value),
         ("path", Session::WebSocket(item)) => wildcard(&item.path, value),
         ("process", Session::Http(item)) => wildcard(&item.request.process, value),
+        ("process", Session::WebSocket(item)) => wildcard(&item.process, value),
+        ("pid", Session::Http(item)) => item
+            .request
+            .pid
+            .is_some_and(|pid| wildcard(&pid.to_string(), value)),
+        ("pid", Session::WebSocket(item)) => item
+            .pid
+            .is_some_and(|pid| wildcard(&pid.to_string(), value)),
         ("status", Session::Http(item)) => item
             .response
             .as_ref()
@@ -39,6 +47,11 @@ fn field_matches(session: &Session, field: &str, value: &str) -> bool {
             .as_ref()
             .and_then(|response| header_value(&response.headers, "content-type"))
             .is_some_and(|content_type| wildcard(content_type, value)),
+        ("risk", item) => wildcard(item.threat().level.label(), value),
+        ("score", item) => numeric_match(item.threat().score as f64, value),
+        ("warning", item) => value
+            .parse::<bool>()
+            .is_ok_and(|expected| item.threat().is_warning() == expected),
         _ => text_contains_pattern(&session.searchable_text(), value, false),
     }
 }
@@ -70,7 +83,10 @@ fn numeric_match(actual: f64, expression: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CapturedExchange, CapturedRequest, CapturedResponse, Session};
+    use crate::model::{
+        CapturedExchange, CapturedRequest, CapturedResponse, Session, ThreatAssessment,
+        ThreatFinding, ThreatLevel,
+    };
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -90,6 +106,7 @@ mod tests {
                 timestamp: Utc::now(),
                 client_addr: String::new(),
                 process: "firefox.exe".into(),
+                process_path: String::new(),
                 pid: None,
             },
             response: Some(CapturedResponse {
@@ -105,6 +122,15 @@ mod tests {
             synthetic: false,
             pinned: false,
             notes: String::new(),
+            threat: ThreatAssessment {
+                score: 35,
+                level: ThreatLevel::Suspicious,
+                findings: vec![ThreatFinding {
+                    title: "Test warning".into(),
+                    evidence: "Test evidence".into(),
+                    score: 35,
+                }],
+            },
         })
     }
 
@@ -116,6 +142,10 @@ mod tests {
             "method:POST host:*.example.com status:>=400 duration:>500ms"
         ));
         assert!(!matches_filter(&session, "process:chrome"));
+        assert!(matches_filter(
+            &session,
+            "risk:suspicious score:>=30 warning:true"
+        ));
     }
 
     #[test]

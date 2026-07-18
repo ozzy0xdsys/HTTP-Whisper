@@ -76,7 +76,7 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CapturedRequest, Header};
+    use crate::model::{CapturedRequest, Header, ThreatAssessment};
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -99,6 +99,7 @@ mod tests {
                 timestamp: Utc::now(),
                 client_addr: String::new(),
                 process: String::new(),
+                process_path: String::new(),
                 pid: None,
             },
             response: None,
@@ -107,6 +108,7 @@ mod tests {
             synthetic: false,
             pinned: false,
             notes: String::new(),
+            threat: ThreatAssessment::default(),
         }
     }
 

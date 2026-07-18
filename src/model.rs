@@ -10,6 +10,69 @@ pub struct Header {
 
 pub type Headers = Vec<Header>;
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreatLevel {
+    #[default]
+    None,
+    Notice,
+    Suspicious,
+    High,
+}
+
+impl ThreatLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Notice => "Notice",
+            Self::Suspicious => "Suspicious",
+            Self::High => "High",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreatFinding {
+    pub title: String,
+    pub evidence: String,
+    pub score: u16,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreatAssessment {
+    pub score: u16,
+    pub level: ThreatLevel,
+    pub findings: Vec<ThreatFinding>,
+}
+
+impl ThreatAssessment {
+    pub fn is_warning(&self) -> bool {
+        self.level >= ThreatLevel::Suspicious
+    }
+
+    pub fn primary_finding(&self) -> Option<&ThreatFinding> {
+        self.findings.iter().max_by_key(|finding| finding.score)
+    }
+
+    pub fn tooltip(&self) -> String {
+        if self.findings.is_empty() {
+            return "No suspicious indicators detected".into();
+        }
+        let details = self
+            .findings
+            .iter()
+            .map(|finding| format!("{}: {}", finding.title, finding.evidence))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "{} risk ({}/100)\n{}",
+            self.level.label(),
+            self.score,
+            details
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CapturedRequest {
     pub method: String,
@@ -23,6 +86,8 @@ pub struct CapturedRequest {
     pub timestamp: DateTime<Utc>,
     pub client_addr: String,
     pub process: String,
+    #[serde(default)]
+    pub process_path: String,
     pub pid: Option<u32>,
 }
 
@@ -70,6 +135,8 @@ pub struct CapturedExchange {
     pub synthetic: bool,
     pub pinned: bool,
     pub notes: String,
+    #[serde(default)]
+    pub threat: ThreatAssessment,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,6 +154,14 @@ pub struct WebSocketMessage {
     pub decoded_as: String,
     pub rule_matched: Option<String>,
     pub timestamp: DateTime<Utc>,
+    #[serde(default)]
+    pub process: String,
+    #[serde(default)]
+    pub process_path: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub threat: ThreatAssessment,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -150,7 +225,7 @@ impl Session {
     pub fn searchable_text(&self) -> String {
         match self {
             Self::Http(value) => format!(
-                "http {} {} {} {} {}",
+                "http {} {} {} {} {} {} {}",
                 value.request.method,
                 value.request.host,
                 value.request.path,
@@ -159,15 +234,38 @@ impl Session {
                     .as_ref()
                     .map(|r| r.status)
                     .unwrap_or_default(),
-                String::from_utf8_lossy(&value.request.body)
+                String::from_utf8_lossy(&value.request.body),
+                value.threat.level.label(),
+                value
+                    .threat
+                    .findings
+                    .iter()
+                    .map(|finding| finding.title.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ),
             Self::WebSocket(value) => format!(
-                "ws websocket {} {} {} {}",
+                "ws websocket {} {} {} {} {} {}",
                 value.direction.label(),
                 value.host,
                 value.path,
-                value.payload
+                value.payload,
+                value.threat.level.label(),
+                value
+                    .threat
+                    .findings
+                    .iter()
+                    .map(|finding| finding.title.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ),
+        }
+    }
+
+    pub fn threat(&self) -> &ThreatAssessment {
+        match self {
+            Self::Http(value) => &value.threat,
+            Self::WebSocket(value) => &value.threat,
         }
     }
 }

@@ -35,8 +35,9 @@ use crate::{
     config::{AppPaths, AppSettings},
     model::{
         CaptureEvent, CapturedExchange, CapturedRequest, CapturedResponse, Direction, Header,
-        Headers, WebSocketMessage,
+        Headers, ThreatAssessment, WebSocketMessage,
     },
+    platform,
     rules::{apply_rewrite, find_auto_response, host_is_hidden, matching_rewrites},
     storage::BodyStore,
     windows_proxy::WindowsProxyManager,
@@ -323,6 +324,7 @@ impl HttpHandler for TrafficHandler {
                     synthetic: true,
                     pinned: false,
                     notes: String::new(),
+                    threat: ThreatAssessment::default(),
                 };
                 let _ = self.shared.events.send(CaptureEvent::Exchange(exchange));
             }
@@ -418,6 +420,7 @@ impl HttpHandler for TrafficHandler {
                     synthetic: pending.synthetic,
                     pinned: false,
                     notes: String::new(),
+                    threat: ThreatAssessment::default(),
                 };
                 let _ = self.shared.events.send(CaptureEvent::Exchange(exchange));
             }
@@ -430,7 +433,7 @@ impl HttpHandler for TrafficHandler {
         _context: &HttpContext,
         error: hudsucker::hyper_util::client::legacy::Error,
     ) -> Response<Body> {
-        let message = format!("Upstream request failed: {error}");
+        let message = format!("Upstream request failed: {}", error_chain(&error));
         if let Some(pending) = self.pending.take() {
             let settings = self.shared.settings.read();
             if !host_is_hidden(&pending.request.host, &settings.hidden_hosts) {
@@ -444,6 +447,7 @@ impl HttpHandler for TrafficHandler {
                     synthetic: false,
                     pinned: false,
                     notes: String::new(),
+                    threat: ThreatAssessment::default(),
                 };
                 let _ = self.shared.events.send(CaptureEvent::Exchange(exchange));
             }
@@ -477,7 +481,7 @@ impl WebSocketHandler for WebSocketTrafficHandler {
         context: &WebSocketContext,
         message: Message,
     ) -> Option<Message> {
-        let (direction, uri) = websocket_context(context);
+        let (direction, uri, client_addr) = websocket_context(context);
         let host = uri.host().unwrap_or("<unknown>").to_owned();
         let path = uri
             .path_and_query()
@@ -513,6 +517,7 @@ impl WebSocketHandler for WebSocketTrafficHandler {
             "ws"
         };
         let url = format!("{scheme}://{host}{path}");
+        let process = platform::resolve_client(client_addr);
         let event = WebSocketMessage {
             id: Uuid::new_v4(),
             sequence: self.shared.next_sequence(),
@@ -527,6 +532,10 @@ impl WebSocketHandler for WebSocketTrafficHandler {
             decoded_as: decoded.label,
             rule_matched: (!matched_names.is_empty()).then(|| matched_names.join(", ")),
             timestamp: Utc::now(),
+            process: process.name,
+            process_path: process.path,
+            pid: process.pid,
+            threat: ThreatAssessment::default(),
         };
         let _ = self.shared.events.send(CaptureEvent::WebSocket(event));
         Some(forwarded)
@@ -744,10 +753,10 @@ fn binary_decoded(text: String, label: &str, kind: DecodeKind, raw_size: usize) 
     }
 }
 
-fn websocket_context(context: &WebSocketContext) -> (Direction, hudsucker::hyper::Uri) {
+fn websocket_context(context: &WebSocketContext) -> (Direction, hudsucker::hyper::Uri, SocketAddr) {
     match context {
-        WebSocketContext::ClientToServer { dst, .. } => (Direction::Out, dst.clone()),
-        WebSocketContext::ServerToClient { src, .. } => (Direction::In, src.clone()),
+        WebSocketContext::ClientToServer { src, dst, .. } => (Direction::Out, dst.clone(), *src),
+        WebSocketContext::ServerToClient { src, dst, .. } => (Direction::In, src.clone(), *dst),
     }
 }
 
@@ -781,6 +790,7 @@ fn request_from_parts(
     let port = uri
         .port_u16()
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let process = platform::resolve_client(context.client_addr);
     CapturedRequest {
         method: parts.method.to_string(),
         scheme,
@@ -796,9 +806,26 @@ fn request_from_parts(
         body,
         timestamp: Utc::now(),
         client_addr: context.client_addr.to_string(),
-        process: String::new(),
-        pid: None,
+        process: process.name,
+        process_path: process.path,
+        pid: process.pid,
     }
+}
+
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(error) = source {
+        let message = error.to_string();
+        if !messages.iter().any(|existing| existing == &message) {
+            messages.push(message);
+        }
+        if messages.len() >= 6 {
+            break;
+        }
+        source = error.source();
+    }
+    messages.join(": ")
 }
 
 fn response_from_parts(

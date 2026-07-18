@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0 - 2026-07-18
+
+- Add stateful suspicious-traffic detection for HTTP, HTTPS, and WebSocket sessions.
+- Add warning symbols, warning counts, risk scores, evidence tooltips, and a dedicated inspector view.
+- Detect beaconing, raw IP destinations, random-looking domains, C2-style paths, unusual processes and User-Agents, malformed headers, plaintext secrets, large or encoded uploads, failover behavior, public tunnels, and traffic spikes.
+- Resolve loopback proxy connections to their owning Windows PID and executable, and correlate suspicious outbound traffic with Windows system-idle time.
+- Add `risk:`, `score:`, `warning:`, `process:`, and `pid:` session filters.
+
 ## 0.6.1 - 2026-07-18
 
 - Remove the interactive breakpoint editor introduced in 0.6.0, including Forward, Drop, and header editing.

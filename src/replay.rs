@@ -43,7 +43,7 @@ pub async fn replay(exchange: &CapturedExchange) -> Result<CapturedResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CapturedRequest, Header};
+    use crate::model::{CapturedRequest, Header, ThreatAssessment};
     use chrono::Utc;
     use std::{
         io::{Read, Write},
@@ -90,6 +90,7 @@ mod tests {
                 timestamp: Utc::now(),
                 client_addr: String::new(),
                 process: String::new(),
+                process_path: String::new(),
                 pid: None,
             },
             response: None,
@@ -98,6 +99,7 @@ mod tests {
             synthetic: false,
             pinned: false,
             notes: String::new(),
+            threat: ThreatAssessment::default(),
         };
         let response = replay(&exchange).await.unwrap();
         assert_eq!(response.status, 201);

@@ -109,6 +109,8 @@ pub struct AppSettings {
     pub auto_install_ca: bool,
     pub start_with_windows: bool,
     pub auto_connect: bool,
+    pub threat_detection_enabled: bool,
+    pub idle_warning_minutes: u64,
     pub theme: String,
     pub autosave_interval_seconds: u64,
     pub body_memory_limit_bytes: usize,
@@ -128,6 +130,8 @@ impl Default for AppSettings {
             auto_install_ca: cfg!(windows),
             start_with_windows: false,
             auto_connect: false,
+            threat_detection_enabled: true,
+            idle_warning_minutes: 5,
             theme: "system".to_owned(),
             autosave_interval_seconds: 30,
             body_memory_limit_bytes: 1_048_576,
@@ -181,6 +185,10 @@ impl AppSettings {
         anyhow::ensure!(
             self.autosave_interval_seconds >= 5,
             "autosave interval must be at least 5 seconds"
+        );
+        anyhow::ensure!(
+            (1..=120).contains(&self.idle_warning_minutes),
+            "idle warning threshold must be between 1 and 120 minutes"
         );
         anyhow::ensure!(
             self.max_session_count > 0,
@@ -282,6 +290,8 @@ mod tests {
         let settings: AppSettings = serde_json::from_str("{}").unwrap();
         assert!(!settings.start_with_windows);
         assert!(!settings.auto_connect);
+        assert!(settings.threat_detection_enabled);
+        assert_eq!(settings.idle_warning_minutes, 5);
     }
 
     #[cfg(not(windows))]

@@ -14,11 +14,13 @@ HTTP Whisper is a native Windows and Linux HTTP, HTTPS, and WebSocket debugging 
 - Live HTTP requests and responses with raw Authorization headers visible in the inspector
 - Live incoming and outgoing WebSocket messages
 - Binary WebSocket decoding for UTF-8, gzip, zlib, raw deflate, and zlib-stream
+- Stateful suspicious-traffic warnings with scored evidence and warning symbols
+- Windows PID/executable attribution and system-idle correlation for proxied traffic
 - Host/path/method automatic response rules with wildcard and `re:` regular-expression matching
 - HTTP and decoded WebSocket text replacement rules with regex capture replacements
 - Case-sensitive and case-insensitive response replacements
 - Multiline Disallowed domains editor with wildcard and `re:` matching
-- Filtering by text and fields such as method, host, path, status, duration, process, and content type
+- Filtering by text and fields such as method, host, path, status, duration, process, PID, content type, and risk
 - Background request replay with captured replay results
 - Pinning, URL copy, JSON/HAR/cURL export APIs, body storage, and SQLite session storage
 - Redacted Authorization, cookie, and proxy credentials in exported data
@@ -113,6 +115,16 @@ Prefix Find with `re:` for regex replacement. Capture groups can be referenced f
 ## WebSockets
 
 WebSocket messages appear as `WS` rows. `OUT` means client-to-server and `IN` means server-to-client. Selecting a row shows its URL, direction, opcode, decoded format, matched rewrite rule, byte size, and payload.
+
+## Suspicious Traffic Warnings
+
+Traffic warnings are enabled by default under **File > Settings**. Suspicious rows show a warning symbol in the Alert column; hover over it for evidence or select the row and open **Warnings**. Scores combine independent indicators, so an ordinary API request with a missing User-Agent remains a notice while stronger or repeated evidence becomes a visible warning.
+
+The detector observes raw IP destinations, random-looking hosts, repeated first-seen destinations, fixed-interval HTTP and WebSocket beaconing, long-running WebSocket activity, C2-style paths, URL shorteners and commonly abused hosting/tunnel services, unusual processes and User-Agents, malformed headers, proxy and tunneling indicators, large uploads, encoded outbound messages, outbound traffic spikes, repeated failures followed by alternate destinations, TLS validation failures, and credentials, cookies, files, screenshots, or system information sent over plaintext HTTP. On Windows, HTTP Whisper resolves loopback connections to their PID and executable and can warn when suspicious outbound traffic occurs after the configured system-idle threshold.
+
+Use filters such as `warning:true`, `risk:high`, `score:>=30`, `process:powershell.exe`, or `pid:1234` to isolate findings.
+
+Warnings are heuristic evidence, not a malware verdict. HTTP Whisper can inspect only traffic routed through its proxy. It does not currently monitor system DNS queries, verify domain registration age, inspect traffic that bypasses the proxy, or expose successful upstream certificate metadata; certificate warnings are available when TLS validation fails. Process attribution and system-idle detection are currently Windows-only.
 
 ## Data And Security
 
