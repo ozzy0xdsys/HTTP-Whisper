@@ -1623,7 +1623,7 @@ impl HttpWhisperApp {
                     }
                     ui.end_row();
                     let mut rows = self.bypass_connections.clone();
-                    rows.sort_by(|left, right| right.last_seen.cmp(&left.last_seen));
+                    rows.sort_by_key(|row| std::cmp::Reverse(row.last_seen));
                     for connection in rows {
                         ui.label(if connection.process.is_empty() {
                             "<unknown>"
@@ -1663,7 +1663,7 @@ impl HttpWhisperApp {
                     ui.strong("Observed");
                     ui.end_row();
                     let mut rows = self.dns_observations.clone();
-                    rows.sort_by(|left, right| right.observed_at.cmp(&left.observed_at));
+                    rows.sort_by_key(|row| std::cmp::Reverse(row.observed_at));
                     for observation in rows.into_iter().take(1_000) {
                         ui.label(observation.host);
                         ui.label(observation.address);

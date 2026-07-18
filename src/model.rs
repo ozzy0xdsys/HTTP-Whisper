@@ -156,7 +156,7 @@ impl ThreatAssessment {
             score,
         });
         self.findings
-            .sort_by(|left, right| right.score.cmp(&left.score));
+            .sort_by_key(|finding| std::cmp::Reverse(finding.score));
         self.level = match self.score {
             0 => ThreatLevel::None,
             1..=29 => ThreatLevel::Notice,

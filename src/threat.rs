@@ -518,7 +518,7 @@ fn finalize(mut assessment: ThreatAssessment) -> ThreatAssessment {
     };
     assessment
         .findings
-        .sort_by(|left, right| right.score.cmp(&left.score));
+        .sort_by_key(|finding| std::cmp::Reverse(finding.score));
     assessment
 }
 
